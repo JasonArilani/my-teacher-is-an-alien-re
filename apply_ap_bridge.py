@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build-time injector for MTIAA AP bridge v3.
+"""Apply MTIAA bridge v4 to clean source (build-time only).
 
-Replaces the proof-of-concept injector for the ap-prototype GitHub Actions build.
-No retail data or vanilla game executable is altered.
+v4 protocol adds per-process session / save-load generation and APPLIED receipts.
+Existing gameplay, checks, item IDs and original pickup flags remain as in v3.
 """
 from pathlib import Path
 
@@ -14,6 +14,8 @@ HEADER = r'''#ifndef MTIAA_AP_BRIDGE_H
 void APBridgePoll();
 void APBridgeSendCheck(int locationId);
 int APBridgeConsumeGrant(int itemId);
+void APBridgeGrantFinished(int itemId, int alreadyPresent);
+void APBridgeStoryReloaded();
 
 #endif
 '''
@@ -23,13 +25,15 @@ CPP = r'''#include "APBridge.h"
 #include <stdio.h>
 #include <string.h>
 
-// Engine message system; the inventory handler is 0x1E.
 void SendGameMessage(int, int, int, int, int, int, int, int, int, int);
 
 static int s_queuedGrantId = 0;
-static int s_pollStarted = 0;
-static int s_invalidAlreadyLogged = 0;
-static int s_removeAlreadyLogged = 0;
+static int s_grantSequence = 0;
+static int s_activeGrantId = 0;
+static int s_activeSequence = 0;
+static int s_sessionStarted = 0;
+static char s_session[64] = "";
+static int s_generation = 0;
 
 static int APBridgePath(char* output, const char* leaf) {
     DWORD length = GetModuleFileNameA(NULL, output, MAX_PATH);
@@ -49,96 +53,101 @@ static int APBridgePath(char* output, const char* leaf) {
     return 1;
 }
 
-static void APBridgeDebug(const char* message) {
+static void APBridgeAppend(const char* leaf, const char* line) {
     char path[MAX_PATH];
-    FILE* output;
-    if (!APBridgePath(path, "debug.log")) return;
-    output = fopen(path, "a");
-    if (output == 0) return;
-    fprintf(output, "%s\n", message);
-    fclose(output);
+    FILE* file;
+    if (!APBridgePath(path, leaf)) return;
+    file = fopen(path, "a");
+    if (file == 0) return;
+    fprintf(file, "%s\n", line);
+    fclose(file);
+}
+
+static void APBridgeEnsureSession() {
+    FILETIME now;
+    char line[128];
+    if (s_sessionStarted) return;
+    GetSystemTimeAsFileTime(&now);
+    sprintf(s_session, "%lu-%lu-%lu",
+        (unsigned long)GetCurrentProcessId(),
+        (unsigned long)now.dwHighDateTime,
+        (unsigned long)now.dwLowDateTime);
+    sprintf(line, "SESSION %s %d", s_session, s_generation);
+    s_sessionStarted = 1;
+    APBridgeAppend("events.log", line);
+    APBridgeAppend("debug.log", "SESSION_STARTED");
+}
+
+void APBridgeStoryReloaded() {
+    char line[128];
+    // Called after the native inventory load finishes, not after a save.
+    ++s_generation;
+    if (!s_sessionStarted) return;
+    sprintf(line, "LOAD %s %d", s_session, s_generation);
+    APBridgeAppend("events.log", line);
+    APBridgeAppend("debug.log", "GAME_INVENTORY_RELOADED");
 }
 
 void APBridgeSendCheck(int locationId) {
-    char path[MAX_PATH];
-    FILE* output;
-    if (!APBridgePath(path, "events.log")) return;
-    output = fopen(path, "a");
-    if (output == 0) return;
-    fprintf(output, "CHECK %d\n", locationId);
-    fclose(output);
-    APBridgeDebug("CHECK_WRITTEN");
+    char line[80];
+    APBridgeEnsureSession();
+    sprintf(line, "CHECK %d", locationId);
+    APBridgeAppend("events.log", line);
 }
 
 int APBridgeConsumeGrant(int itemId) {
     if (s_queuedGrantId != itemId) return 0;
+    s_activeGrantId = itemId;
+    s_activeSequence = s_grantSequence;
     s_queuedGrantId = 0;
-    APBridgeDebug("GRANT_HANDLER_REACHED");
+    s_grantSequence = 0;
     return 1;
 }
 
+void APBridgeGrantFinished(int itemId, int alreadyPresent) {
+    char line[160];
+    if (s_activeGrantId != itemId || s_activeSequence <= 0) return;
+    sprintf(line, "APPLIED %s %d %d %d %d", s_session, s_generation,
+        s_activeSequence, itemId, alreadyPresent);
+    APBridgeAppend("applied.log", line);
+    s_activeGrantId = 0;
+    s_activeSequence = 0;
+}
+
 void APBridgePoll() {
-    char path[MAX_PATH];
-    char queuedPath[MAX_PATH];
+    char inboxPath[MAX_PATH];
     char line[128];
     char command[16];
     char* start;
     int itemId = 0;
     int sequence = 0;
     FILE* input;
-    FILE* output;
-
-    if (!s_pollStarted) {
-        s_pollStarted = 1;
-        APBridgeDebug("POLL_STARTED");
-    }
-    if (s_queuedGrantId != 0) return;
-    if (!APBridgePath(path, "inbox.txt")) return;
-    input = fopen(path, "rb");
+    APBridgeEnsureSession();
+    if (s_queuedGrantId != 0 || s_activeGrantId != 0) return;
+    if (!APBridgePath(inboxPath, "inbox.txt")) return;
+    input = fopen(inboxPath, "rb");
     if (input == 0) return;
     if (fgets(line, sizeof(line), input) == 0) {
         fclose(input);
         return;
     }
     fclose(input);
-
     start = line;
-    // Accept the optional UTF-8 BOM produced by some text editors.
     if ((unsigned char)start[0] == 0xEF &&
         (unsigned char)start[1] == 0xBB &&
-        (unsigned char)start[2] == 0xBF) {
-        start += 3;
-    }
+        (unsigned char)start[2] == 0xBF) start += 3;
     command[0] = 0;
     if (sscanf(start, " %15s %d %d", command, &itemId, &sequence) != 3 ||
-        strcmp(command, "GRANT") != 0 || itemId < 1 || itemId > 21 || sequence < 0) {
-        if (!s_invalidAlreadyLogged) {
-            APBridgeDebug("INBOX_INVALID_FORMAT");
-            s_invalidAlreadyLogged = 1;
-        }
+        strcmp(command, "GRANT") != 0 || itemId < 1 || itemId > 21 || sequence <= 0) {
+        APBridgeAppend("debug.log", "INBOX_INVALID_FORMAT");
         return;
     }
-    s_invalidAlreadyLogged = 0;
-
-    if (remove(path) != 0) {
-        if (!s_removeAlreadyLogged) {
-            APBridgeDebug("INBOX_REMOVE_FAILED");
-            s_removeAlreadyLogged = 1;
-        }
+    if (remove(inboxPath) != 0) {
+        APBridgeAppend("debug.log", "INBOX_REMOVE_FAILED");
         return;
     }
-    s_removeAlreadyLogged = 0;
-
-    // This acknowledges dispatch, NOT successful in-game possession.
     s_queuedGrantId = itemId;
-    APBridgeDebug("GRANT_PARSED_AND_QUEUED");
-    if (APBridgePath(queuedPath, "queued.log")) {
-        output = fopen(queuedPath, "a");
-        if (output != 0) {
-            fprintf(output, "QUEUED %d %d\n", sequence, itemId);
-            fclose(output);
-        }
-    }
+    s_grantSequence = sequence;
     SendGameMessage(0x1E, itemId, 0x1E, 0, 0x17, 0, 0, 0, 0, 0);
 }
 '''
@@ -164,7 +173,7 @@ def main():
     bridge_h = ROOT / 'src' / 'APBridge.h'
     bridge_cpp = ROOT / 'src' / 'APBridge.cpp'
     if bridge_h.exists() or bridge_cpp.exists():
-        raise RuntimeError('APBridge files already exist. Start from a clean source checkout.')
+        raise RuntimeError('APBridge files already exist. Start from a clean checkout.')
 
     engine = change_once(engine, '#include "GameLoopHelper.h"\n',
                          '#include "GameLoopHelper.h"\n#include "APBridge.h"\n', 'Engine include')
@@ -177,35 +186,39 @@ def main():
         '        itemId = action->addressValue;\n        if (itemId == 0) break;\n\n'
         '        if (FindItemInList(itemId) != 0) break;',
         '        itemId = action->addressValue;\n        if (itemId == 0) break;\n\n'
-        '        // A received AP item is independent of its vanilla pickup location.\n'
-        '        // Consume grant status before FindItemInList: the location must\n'
-        '        // still be checkable when the player already owns that item.\n'
+        '        // AP ownership and the physical pickup are separate.\n'
         '        int apGranted = APBridgeConsumeGrant(itemId);\n'
-        '        // First two prototype locations: Susan\'s recorder and the magnet.\n'
         '        if (!apGranted && (itemId == 5 || itemId == 7)) {\n'
         '            T_Object* pickup = (T_Object*)FindItem(itemId);\n'
         '            if (pickup != 0) pickup->Reset();\n'
         '            APBridgeSendCheck(itemId == 5 ? 1001 : 1002);\n'
         '            break;\n'
-        '        }\n\n'
-        '        if (FindItemInList(itemId) != 0) break;', 'Inventory insert')
-
-    # Vanilla insert resets OBJ###, which is also the in-world pickup flag.
-    # For AP-granted items, skip that reset: the original location must
-    # remain available until its separate AP check is actually collected.
+        '        }\n'
+        '        if (FindItemInList(itemId) != 0) {\n'
+        '            if (apGranted) APBridgeGrantFinished(itemId, 1);\n'
+        '            break;\n'
+        '        }', 'Inventory add/receipt')
     inventory = change_once(inventory,
         '        item = (T_Object*)FindItem(itemId);\n        item->Reset();',
         '        item = (T_Object*)FindItem(itemId);\n'
-        '        if (!apGranted) item->Reset();', 'Inventory location ownership separation')
-
-    # Prepare all results before mutating the checkout.
-    engine_bytes = engine.replace('\n', eng_eol).encode('utf-8')
-    inventory_bytes = inventory.replace('\n', inv_eol).encode('utf-8')
-    engine_path.write_bytes(engine_bytes)
-    inventory_path.write_bytes(inventory_bytes)
+        '        if (!apGranted) item->Reset();', 'Inventory pickup flag')
+    inventory = change_once(inventory,
+        '        DisplayPanels(itemId);\n        break;\n    }\n    case 0x18:',
+        '        DisplayPanels(itemId);\n'
+        '        if (apGranted) APBridgeGrantFinished(itemId, 0);\n'
+        '        break;\n    }\n    case 0x18:', 'Inventory receipt acknowledged')
+    inventory = change_once(inventory,
+        '        fread((char*)&g_SelectedItem_0046a6e4->objectFlags, 4, 1, (FILE*)fp);\n'
+        '    }\n}\n\n// Stubs (moved from stubs.cpp)',
+        '        fread((char*)&g_SelectedItem_0046a6e4->objectFlags, 4, 1, (FILE*)fp);\n'
+        '    }\n'
+        '    APBridgeStoryReloaded();\n'
+        '}\n\n// Stubs (moved from stubs.cpp)', 'Inventory load notification')
+    engine_path.write_bytes(engine.replace('\n', eng_eol).encode('utf-8'))
+    inventory_path.write_bytes(inventory.replace('\n', inv_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v3 applied: pickup and AP grant state separated')
+    print('AP bridge v4 applied: session, inventory-load epoch and applied acknowledgments')
 
 
 if __name__ == '__main__':
