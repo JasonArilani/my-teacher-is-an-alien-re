@@ -14,23 +14,33 @@ jobs:
       - name: Check out reconstructed source and compiler submodules
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
 
-      - name: Install Linux build dependencies
+      # Match the compiler setup in this repository's already-passing ci.yaml.
+      - name: Install required build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build clang git
+          sudo apt-get install -y ninja-build gcc g++ gcc-multilib g++-multilib libclang-dev clang lld cmake
 
-      - name: Compile the full Windows game executable
+      - name: Install project Python requirements
+        run: pip3 install -r requirements.txt
+
+      # The project's existing CI fetches this runtime DLL for its original MSVC 4.20 compiler.
+      - name: Install MSVC runtime dependency
+        run: |
+          wget "https://discmaster.textfiles.com/file/858/boot-disc-1998-05.iso/Utils/Online/Internet%20Explorer%204.01/IE4MFC40.CAB/MSVCRT40.DLL" -O compilers/msvc420/bin/MSVCRT40.DLL
+          test -s compilers/msvc420/bin/MSVCRT40.DLL
+
+      - name: Compile the reconstructed game
         run: make TEACHER.EXE
 
-      - name: Confirm build output
+      - name: Verify the output
         run: |
           test -s TEACHER.EXE
           file TEACHER.EXE
           sha256sum TEACHER.EXE
 
-      - name: Upload reconstructed executable
+      - name: Upload the executable
         uses: actions/upload-artifact@v4
         with:
           name: mtiaa-reconstructed-exe
