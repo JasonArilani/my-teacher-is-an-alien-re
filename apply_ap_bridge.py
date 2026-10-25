@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build-time injector for MTIAA AP bridge v2.
+"""Build-time injector for MTIAA AP bridge v3.
 
 Replaces the proof-of-concept injector for the ap-prototype GitHub Actions build.
 No retail data or vanilla game executable is altered.
@@ -177,17 +177,26 @@ def main():
         '        itemId = action->addressValue;\n        if (itemId == 0) break;\n\n'
         '        if (FindItemInList(itemId) != 0) break;',
         '        itemId = action->addressValue;\n        if (itemId == 0) break;\n\n'
-        '        // Prototype AP location: Susan\'s Tape Player (object 5).\n'
-        '        // Complete the pickup flag (OBJ005), but do not award its item.\n'
-        '        // A grant from the AP bridge bypasses this location check.\n'
-        '        if (itemId == 5 && !APBridgeConsumeGrant(itemId)) {\n'
+        '        // A received AP item is independent of its vanilla pickup location.\n'
+        '        // Consume grant status before FindItemInList: the location must\n'
+        '        // still be checkable when the player already owns that item.\n'
+        '        int apGranted = APBridgeConsumeGrant(itemId);\n'
+        '        // First two prototype locations: Susan\'s recorder and the magnet.\n'
+        '        if (!apGranted && (itemId == 5 || itemId == 7)) {\n'
         '            T_Object* pickup = (T_Object*)FindItem(itemId);\n'
         '            if (pickup != 0) pickup->Reset();\n'
-        '            APBridgeSendCheck(1001);\n'
+        '            APBridgeSendCheck(itemId == 5 ? 1001 : 1002);\n'
         '            break;\n'
-        '        }\n'
-        '        if (itemId != 5) APBridgeConsumeGrant(itemId);\n\n'
+        '        }\n\n'
         '        if (FindItemInList(itemId) != 0) break;', 'Inventory insert')
+
+    # Vanilla insert resets OBJ###, which is also the in-world pickup flag.
+    # For AP-granted items, skip that reset: the original location must
+    # remain available until its separate AP check is actually collected.
+    inventory = change_once(inventory,
+        '        item = (T_Object*)FindItem(itemId);\n        item->Reset();',
+        '        item = (T_Object*)FindItem(itemId);\n'
+        '        if (!apGranted) item->Reset();', 'Inventory location ownership separation')
 
     # Prepare all results before mutating the checkout.
     engine_bytes = engine.replace('\n', eng_eol).encode('utf-8')
@@ -196,7 +205,7 @@ def main():
     inventory_path.write_bytes(inventory_bytes)
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v2 applied: pickup completion and command diagnostics')
+    print('AP bridge v3 applied: pickup and AP grant state separated')
 
 
 if __name__ == '__main__':
