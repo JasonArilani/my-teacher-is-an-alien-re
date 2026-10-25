@@ -1,0 +1,139 @@
+diff --git a/src/GameEngine.cpp b/src/GameEngine.cpp
+--- a/src/GameEngine.cpp
++++ b/src/GameEngine.cpp
+@@ -19,5 +19,6 @@
+ #include <windows.h>
+ // External functions
+ #include "GameLoopHelper.h"
++#include "APBridge.h"
+ 
+ // Also declared in string.h; local prototypes keep this TU's MSVC 4.20
+@@ -96,5 +96,6 @@
+             ProcessInput();
+             if (m_exitFlag != 0) break;
++            APBridgePoll();
+             ProcessEvents();
+             if (m_exitFlag != 0) break;
+             UpdateHandlers();
+diff --git a/src/SCI_Inventory.cpp b/src/SCI_Inventory.cpp
+--- a/src/SCI_Inventory.cpp
++++ b/src/SCI_Inventory.cpp
+@@ -13,4 +13,5 @@
+ #include "MsgList.h"
+ #include "string.h"
+ #include "MouseControl.h"
++#include "APBridge.h"
+ // The no-op cast is load-bearing: without it MSVC swaps the counter/curNode
+@@ -617,4 +617,12 @@
+         itemId = action->addressValue;
+         if (itemId == 0) break;
+ 
++        // The original Tape Player pickup is an AP location (1001), not
++        // a vanilla inventory reward. AP-granted Tape Players bypass this.
++        if (itemId == 5 && !APBridgeConsumeGrant(itemId)) {
++            APBridgeSendCheck(1001);
++            break;
++        }
++        if (itemId != 5) APBridgeConsumeGrant(itemId);
++
+         if (FindItemInList(itemId) != 0) break;
+diff --git a/src/APBridge.h b/src/APBridge.h
+new file mode 100644
+--- /dev/null
++++ b/src/APBridge.h
+@@ -0,0 +1,10 @@
++#ifndef MTIAA_AP_BRIDGE_H
++#define MTIAA_AP_BRIDGE_H
++
++// Transport between the reconstructed game and a future AP client.
++// All files live in CDDATA\DATA\apbridge next to the game assets.
++void APBridgePoll();
++void APBridgeSendCheck(int locationId);
++int APBridgeConsumeGrant(int itemId);
++
++#endif
+diff --git a/src/APBridge.cpp b/src/APBridge.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/APBridge.cpp
+@@ -0,0 +1,80 @@
++#include "APBridge.h"
++#include <windows.h>
++#include <stdio.h>
++#include <string.h>
++
++// Existing game message queue; inventory handler ID is 0x1E.
++void SendGameMessage(int, int, int, int, int, int, int, int, int, int);
++
++static int s_queuedGrantId = 0;
++
++static int APBridgePath(char* buffer, const char* filename) {
++    DWORD length = GetModuleFileNameA(NULL, buffer, MAX_PATH);
++    char* separator;
++    if (length == 0 || length >= MAX_PATH) return 0;
++    separator = strrchr(buffer, '\\');
++    if (separator == 0) return 0;
++    *separator = 0;
++    if (strlen(buffer) + strlen("\\DATA\\apbridge") + 1 >= MAX_PATH) return 0;
++    strcat(buffer, "\\DATA\\apbridge");
++    CreateDirectoryA(buffer, NULL);
++    if (filename != 0) {
++        if (strlen(buffer) + 1 + strlen(filename) + 1 >= MAX_PATH) return 0;
++        strcat(buffer, "\\");
++        strcat(buffer, filename);
++    }
++    return 1;
++}
++
++void APBridgeSendCheck(int locationId) {
++    char filename[MAX_PATH];
++    FILE* file;
++    if (!APBridgePath(filename, "events.log")) return;
++    file = fopen(filename, "a");
++    if (file == 0) return;
++    fprintf(file, "CHECK %d\n", locationId);
++    fclose(file);
++}
++
++int APBridgeConsumeGrant(int itemId) {
++    if (s_queuedGrantId != itemId) return 0;
++    s_queuedGrantId = 0;
++    return 1;
++}
++
++void APBridgePoll() {
++    char inputPath[MAX_PATH];
++    char queuedPath[MAX_PATH];
++    char line[80];
++    char command[16];
++    int itemId = 0;
++    int sequence = 0;
++    FILE* file;
++
++    // Only one outstanding queued grant in the initial prototype.
++    if (s_queuedGrantId != 0) return;
++    if (!APBridgePath(inputPath, "inbox.txt")) return;
++    file = fopen(inputPath, "r");
++    if (file == 0) return;
++    line[0] = 0;
++    if (fgets(line, sizeof(line), file) == 0) {
++        fclose(file);
++        return;
++    }
++    fclose(file);
++    command[0] = 0;
++    if (sscanf(line, "%15s %d %d", command, &itemId, &sequence) != 3) return;
++    if (strcmp(command, "GRANT") != 0 || itemId < 1 || itemId > 21) return;
++    if (remove(inputPath) != 0) return;
++
++    // This is a queue-only acknowledgement. Server-authoritative sync,
++    // replays, and durable item IDs will be implemented with the AP client.
++    s_queuedGrantId = itemId;
++    SendGameMessage(0x1E, itemId, 0x1E, 0, 0x17, 0, 0, 0, 0, 0);
++    if (!APBridgePath(queuedPath, "queued.log")) return;
++    file = fopen(queuedPath, "a");
++    if (file != 0) {
++        fprintf(file, "QUEUED %d %d\n", sequence, itemId);
++        fclose(file);
++    }
++}
