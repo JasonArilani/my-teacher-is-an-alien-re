@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Apply MTIAA bridge v5 to clean source (build-time only).
+"""Apply MTIAA bridge v6 to clean source (build-time only).
 
-v5 adds world-scoped messages, post-load reconciliation and gameplay readiness.
+v6 preserves v5 persistence and adds Radio, Tuning Fork and speech recipe.
 Existing gameplay, checks, item IDs and original pickup flags remain as in v3.
 """
 from pathlib import Path
@@ -16,12 +16,17 @@ int APBridgeConsumeGrant(int itemId);
 void APBridgeGrantFinished(int itemId, int alreadyPresent);
 void APBridgeStoryReloaded();
 void APBridgeGameplayReady();
+int APBridgeInterceptRecipeFlag(int stateId, int instruction);
 #endif
 '''
 CPP = r'''#include "APBridge.h"
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include "GameState.h"
+#include "GameEngine.h"
+#include "SCI_Inventory.h"
+#include "globals.h"
 
 void SendGameMessage(int, int, int, int, int, int, int, int, int, int);
 static char s_world[65] = "";
@@ -121,6 +126,13 @@ void APBridgeStoryReloaded() {
     // GameEngine::Serialize finished loading all the handlers.
     APBridgeGameplayReady();
 }
+int APBridgeInterceptRecipeFlag(int stateId, int instruction) {
+    // QUEST19.MIS QUESTION2507 turns on GAMESTATE 77. Give a location
+    // check, not the vanilla recipe unlock. AP delivery unlocks it instead.
+    if (stateId != 77 || instruction != 0xF) return 0;
+    APBridgeSendCheck(1005);
+    return 1;
+}
 void APBridgeSendCheck(int locationId) {
     char line[200];
     APBridgeEnsureSession();
@@ -163,7 +175,7 @@ void APBridgePoll() {
     command[0] = 0; world[0] = 0; session[0] = 0;
     if (sscanf(line, " %15s %64s %63s %d %d %d", command, world, session,
                &generation, &itemId, &seq) != 6 || strcmp(command, "GRANT") ||
-               itemId < 1 || itemId > 21 || seq <= 0) {
+               itemId < 1 || itemId > 22 || seq <= 0) {
         APBridgeAppend("debug.log", "INBOX_INVALID_FORMAT");
         return;
     }
@@ -175,6 +187,34 @@ void APBridgePoll() {
     if (remove(inboxPath) != 0) return;
     s_queuedGrantId = itemId;
     s_queuedSequence = seq;
+    if (itemId == 22) {
+        // Item 22 is a virtual AP recipe. The original game knowledge flag
+        // is 77; there is no INVENTOR item 22 and no new .MIS needed.
+        GameState* gs = g_GameState_0046aa30;
+        if (gs == 0 || gs->stateValues == 0 || gs->maxStates <= 77) {
+            s_queuedGrantId = 0;
+            s_queuedSequence = 0;
+            APBridgeAppend("debug.log", "RECIPE_GAMESTATE_NOT_READY");
+            return;
+        }
+        s_activeGrantId = s_queuedGrantId;
+        s_activeSequence = s_queuedSequence;
+        s_queuedGrantId = 0;
+        s_queuedSequence = 0;
+        {
+            int alreadyPresent = gs->stateValues[77] != 0;
+            gs->stateValues[77] = 1;
+            // If all three ingredients were already found, the recipe is the
+            // last requirement. Reuse the game's native AUTOCOMBINE panels.
+            GameEngine* engine = g_GameEngine_0046a6ec;
+            if (engine != 0) {
+                SCI_Inventory* inv = (SCI_Inventory*)engine->FindHandlerInList(0x1E);
+                if (inv != 0) inv->DisplayPanels(0);
+            }
+            APBridgeGrantFinished(itemId, alreadyPresent);
+        }
+        return;
+    }
     SendGameMessage(0x1E, itemId, 0x1E, 0, 0x17, 0, 0, 0, 0, 0);
 }
 '''
@@ -198,6 +238,7 @@ def main():
     engine_path, engine, eng_eol = load('GameEngine.cpp')
     inventory_path, inventory, inv_eol = load('SCI_Inventory.cpp')
     school_path, school, school_eol = load('SCI_SchoolMenu.cpp')
+    state_path, state, state_eol = load('GameState.cpp')
     bridge_h = ROOT / 'src' / 'APBridge.h'
     bridge_cpp = ROOT / 'src' / 'APBridge.cpp'
     if bridge_h.exists() or bridge_cpp.exists():
@@ -216,10 +257,16 @@ def main():
         '        itemId = action->addressValue;\n        if (itemId == 0) break;\n\n'
         '        // AP ownership and the physical pickup are separate.\n'
         '        int apGranted = APBridgeConsumeGrant(itemId);\n'
-        '        if (!apGranted && (itemId == 5 || itemId == 7)) {\n'
+        '        if (!apGranted && (itemId == 5 || itemId == 7 || itemId == 2 || itemId == 8)) {\n'
         '            T_Object* pickup = (T_Object*)FindItem(itemId);\n'
         '            if (pickup != 0) pickup->Reset();\n'
-        '            APBridgeSendCheck(itemId == 5 ? 1001 : 1002);\n'
+        '            APBridgeSendCheck(itemId == 5 ? 1001 : itemId == 7 ? 1002 : itemId == 2 ? 1003 : 1004);\n'
+        '            break;\n'
+        '        }\n'
+        '        // Completed Disrupt Speech Test represents consumed ingredients.\n'
+        '        if (apGranted && (itemId == 2 || itemId == 7 || itemId == 8) &&\n'
+        '            FindItemInList(18) != 0) {\n'
+        '            APBridgeGrantFinished(itemId, 1);\n'
         '            break;\n'
         '        }\n'
         '        if (FindItemInList(itemId) != 0) {\n'
@@ -235,6 +282,12 @@ def main():
         '        DisplayPanels(itemId);\n'
         '        if (apGranted) APBridgeGrantFinished(itemId, 0);\n'
         '        break;\n    }\n    case 0x18:', 'Inventory receipt acknowledged')
+    state = change_once(state, '#include "GameState.h"\n',
+        '#include "GameState.h"\n#include "APBridge.h"\n', 'Gamestate bridge include')
+    state = change_once(state,
+        '    switch (action->instruction) {\n',
+        '    if (APBridgeInterceptRecipeFlag(idx, action->instruction)) return;\n'
+        '    switch (action->instruction) {\n', 'Recipe flag interception')
     # A saved game's inventory handler is optional. Hook after all handlers loaded.
     engine = change_once(engine,
         '        h->Serialize(param);\n    }\n}',
@@ -249,9 +302,10 @@ def main():
     engine_path.write_bytes(engine.replace('\n', eng_eol).encode('utf-8'))
     school_path.write_bytes(school.replace('\n', school_eol).encode('utf-8'))
     inventory_path.write_bytes(inventory.replace('\n', inv_eol).encode('utf-8'))
+    state_path.write_bytes(state.replace('\n', state_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v5 applied: world, ready, complete load and receipts')
+    print('AP bridge v6 applied: five locations including recipe, persistence and receipts')
 
 
 if __name__ == '__main__':
