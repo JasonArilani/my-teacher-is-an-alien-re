@@ -1,0 +1,39 @@
+name: Build reconstructed TEACHER.EXE
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out reconstructed source and compiler submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build clang git
+
+      - name: Compile the full Windows game executable
+        run: make TEACHER.EXE
+
+      - name: Confirm build output
+        run: |
+          test -s TEACHER.EXE
+          file TEACHER.EXE
+          sha256sum TEACHER.EXE
+
+      - name: Upload reconstructed executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtiaa-reconstructed-exe
+          path: TEACHER.EXE
+          if-no-files-found: error
+          retention-days: 14
