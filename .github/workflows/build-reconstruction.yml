@@ -31,6 +31,11 @@ jobs:
           wget "https://discmaster.textfiles.com/file/858/boot-disc-1998-05.iso/Utils/Online/Internet%20Explorer%204.01/IE4MFC40.CAB/MSVCRT40.DLL" -O compilers/msvc420/bin/MSVCRT40.DLL
           test -s compilers/msvc420/bin/MSVCRT40.DLL
 
+      - name: Apply AP bridge prototype
+        run: |
+          git apply --check mtiaa-ap-prototype.patch
+          git apply mtiaa-ap-prototype.patch
+
       - name: Compile the reconstructed game
         run: make TEACHER.EXE
 
