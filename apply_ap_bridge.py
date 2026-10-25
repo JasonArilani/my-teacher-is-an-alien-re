@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Apply MTIAA bridge v4 to clean source (build-time only).
+"""Apply MTIAA bridge v5 to clean source (build-time only).
 
-v4 protocol adds per-process session / save-load generation and APPLIED receipts.
+v5 adds world-scoped messages, post-load reconciliation and gameplay readiness.
 Existing gameplay, checks, item IDs and original pickup flags remain as in v3.
 """
 from pathlib import Path
@@ -10,30 +10,30 @@ ROOT = Path(__file__).resolve().parent
 
 HEADER = r'''#ifndef MTIAA_AP_BRIDGE_H
 #define MTIAA_AP_BRIDGE_H
-
 void APBridgePoll();
 void APBridgeSendCheck(int locationId);
 int APBridgeConsumeGrant(int itemId);
 void APBridgeGrantFinished(int itemId, int alreadyPresent);
 void APBridgeStoryReloaded();
-
+void APBridgeGameplayReady();
 #endif
 '''
-
 CPP = r'''#include "APBridge.h"
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
 
 void SendGameMessage(int, int, int, int, int, int, int, int, int, int);
-
+static char s_world[65] = "";
+static char s_session[64] = "";
+static int s_bound = 0;
+static int s_worldConflict = 0;
+static int s_ready = 0;
+static int s_generation = 0;
 static int s_queuedGrantId = 0;
-static int s_grantSequence = 0;
+static int s_queuedSequence = 0;
 static int s_activeGrantId = 0;
 static int s_activeSequence = 0;
-static int s_sessionStarted = 0;
-static char s_session[64] = "";
-static int s_generation = 0;
 
 static int APBridgePath(char* output, const char* leaf) {
     DWORD length = GetModuleFileNameA(NULL, output, MAX_PATH);
@@ -52,102 +52,129 @@ static int APBridgePath(char* output, const char* leaf) {
     }
     return 1;
 }
-
 static void APBridgeAppend(const char* leaf, const char* line) {
-    char path[MAX_PATH];
-    FILE* file;
+    char path[MAX_PATH]; FILE* file;
     if (!APBridgePath(path, leaf)) return;
     file = fopen(path, "a");
     if (file == 0) return;
     fprintf(file, "%s\n", line);
     fclose(file);
 }
-
-static void APBridgeEnsureSession() {
-    FILETIME now;
-    char line[128];
-    if (s_sessionStarted) return;
-    GetSystemTimeAsFileTime(&now);
-    sprintf(s_session, "%lu-%lu-%lu",
-        (unsigned long)GetCurrentProcessId(),
-        (unsigned long)now.dwHighDateTime,
-        (unsigned long)now.dwLowDateTime);
-    sprintf(line, "SESSION %s %d", s_session, s_generation);
-    s_sessionStarted = 1;
-    APBridgeAppend("events.log", line);
-    APBridgeAppend("debug.log", "SESSION_STARTED");
-}
-
-void APBridgeStoryReloaded() {
-    char line[128];
-    // Called after the native inventory load finishes, not after a save.
-    ++s_generation;
-    if (!s_sessionStarted) return;
-    sprintf(line, "LOAD %s %d", s_session, s_generation);
-    APBridgeAppend("events.log", line);
-    APBridgeAppend("debug.log", "GAME_INVENTORY_RELOADED");
-}
-
-void APBridgeSendCheck(int locationId) {
-    char line[80];
-    APBridgeEnsureSession();
-    sprintf(line, "CHECK %d", locationId);
-    APBridgeAppend("events.log", line);
-}
-
-int APBridgeConsumeGrant(int itemId) {
-    if (s_queuedGrantId != itemId) return 0;
-    s_activeGrantId = itemId;
-    s_activeSequence = s_grantSequence;
-    s_queuedGrantId = 0;
-    s_grantSequence = 0;
+static int APBridgeBinding(char* buffer) {
+    char path[MAX_PATH]; FILE* file; int i;
+    if (!APBridgePath(path, "binding.txt")) return 0;
+    file = fopen(path, "rb");
+    if (file == 0) return 0;
+    buffer[0] = 0;
+    if (fgets(buffer, 68, file) == 0) { fclose(file); return 0; }
+    fclose(file);
+    // The client writes the first 32 hex characters of SHA256.
+    if (strlen(buffer) < 32) return 0;
+    for (i = 0; i < 32; ++i) {
+        char c = buffer[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0;
+    }
+    buffer[32] = 0;
     return 1;
 }
-
+static void APBridgeEnsureSession() {
+    char newWorld[68]; char line[200]; FILETIME now;
+    if (!APBridgeBinding(newWorld)) return;
+    if (s_bound) {
+        if (strcmp(s_world, newWorld) != 0 && !s_worldConflict) {
+            s_worldConflict = 1;
+            s_ready = 0;
+            APBridgeAppend("debug.log", "WORLD_CHANGED_RESTART_GAME_REQUIRED");
+        }
+        return;
+    }
+    strcpy(s_world, newWorld);
+    GetSystemTimeAsFileTime(&now);
+    sprintf(s_session, "%lu-%lu-%lu", (unsigned long)GetCurrentProcessId(),
+        (unsigned long)now.dwHighDateTime, (unsigned long)now.dwLowDateTime);
+    s_bound = 1;
+    sprintf(line, "SESSION %s %s %d", s_world, s_session, s_generation);
+    APBridgeAppend("events.log", line);
+    APBridgeAppend("debug.log", "SESSION_STARTED_V5");
+}
+void APBridgeGameplayReady() {
+    char line[200];
+    APBridgeEnsureSession();
+    if (!s_bound || s_worldConflict || s_ready) return;
+    s_ready = 1;
+    sprintf(line, "READY %s %s %d", s_world, s_session, s_generation);
+    APBridgeAppend("events.log", line);
+}
+void APBridgeStoryReloaded() {
+    char line[200];
+    APBridgeEnsureSession();
+    if (!s_bound || s_worldConflict) return;
+    ++s_generation;
+    s_ready = 0;
+    s_queuedGrantId = 0;
+    s_queuedSequence = 0;
+    s_activeGrantId = 0;
+    s_activeSequence = 0;
+    sprintf(line, "LOAD %s %s %d", s_world, s_session, s_generation);
+    APBridgeAppend("events.log", line);
+    APBridgeAppend("debug.log", "GAME_LOAD_COMPLETE_V5");
+    // GameEngine::Serialize finished loading all the handlers.
+    APBridgeGameplayReady();
+}
+void APBridgeSendCheck(int locationId) {
+    char line[200];
+    APBridgeEnsureSession();
+    if (!s_bound || s_worldConflict || !s_ready) {
+        APBridgeAppend("debug.log", "CHECK_BLOCKED_NOT_READY");
+        return;
+    }
+    sprintf(line, "CHECK %s %s %d", s_world, s_session, locationId);
+    APBridgeAppend("events.log", line);
+}
+int APBridgeConsumeGrant(int itemId) {
+    if (!s_ready || s_worldConflict || s_queuedGrantId != itemId) return 0;
+    s_activeGrantId = itemId;
+    s_activeSequence = s_queuedSequence;
+    s_queuedGrantId = 0;
+    s_queuedSequence = 0;
+    return 1;
+}
 void APBridgeGrantFinished(int itemId, int alreadyPresent) {
-    char line[160];
-    if (s_activeGrantId != itemId || s_activeSequence <= 0) return;
-    sprintf(line, "APPLIED %s %d %d %d %d", s_session, s_generation,
-        s_activeSequence, itemId, alreadyPresent);
+    char line[220];
+    if (!s_bound || s_worldConflict || s_activeGrantId != itemId || s_activeSequence <= 0) return;
+    sprintf(line, "APPLIED %s %s %d %d %d %d", s_world, s_session,
+        s_generation, s_activeSequence, itemId, alreadyPresent);
     APBridgeAppend("applied.log", line);
     s_activeGrantId = 0;
     s_activeSequence = 0;
 }
-
 void APBridgePoll() {
-    char inboxPath[MAX_PATH];
-    char line[128];
-    char command[16];
-    char* start;
-    int itemId = 0;
-    int sequence = 0;
+    char inboxPath[MAX_PATH], line[220], command[16], world[65], session[64];
+    int itemId = 0, seq = 0, generation = 0;
     FILE* input;
     APBridgeEnsureSession();
-    if (s_queuedGrantId != 0 || s_activeGrantId != 0) return;
+    if (!s_bound || !s_ready || s_worldConflict || s_queuedGrantId || s_activeGrantId) return;
     if (!APBridgePath(inboxPath, "inbox.txt")) return;
     input = fopen(inboxPath, "rb");
     if (input == 0) return;
-    if (fgets(line, sizeof(line), input) == 0) {
-        fclose(input);
-        return;
-    }
+    line[0] = 0;
+    if (fgets(line, sizeof(line), input) == 0) { fclose(input); return; }
     fclose(input);
-    start = line;
-    if ((unsigned char)start[0] == 0xEF &&
-        (unsigned char)start[1] == 0xBB &&
-        (unsigned char)start[2] == 0xBF) start += 3;
-    command[0] = 0;
-    if (sscanf(start, " %15s %d %d", command, &itemId, &sequence) != 3 ||
-        strcmp(command, "GRANT") != 0 || itemId < 1 || itemId > 21 || sequence <= 0) {
+    command[0] = 0; world[0] = 0; session[0] = 0;
+    if (sscanf(line, " %15s %64s %63s %d %d %d", command, world, session,
+               &generation, &itemId, &seq) != 6 || strcmp(command, "GRANT") ||
+               itemId < 1 || itemId > 21 || seq <= 0) {
         APBridgeAppend("debug.log", "INBOX_INVALID_FORMAT");
         return;
     }
-    if (remove(inboxPath) != 0) {
-        APBridgeAppend("debug.log", "INBOX_REMOVE_FAILED");
+    if (strcmp(world, s_world) || strcmp(session, s_session) || generation != s_generation) {
+        // Stale commands can never be applied to a new world/session/load.
+        if (remove(inboxPath) == 0) APBridgeAppend("debug.log", "STALE_GRANT_DISCARDED");
         return;
     }
+    if (remove(inboxPath) != 0) return;
     s_queuedGrantId = itemId;
-    s_grantSequence = sequence;
+    s_queuedSequence = seq;
     SendGameMessage(0x1E, itemId, 0x1E, 0, 0x17, 0, 0, 0, 0, 0);
 }
 '''
@@ -170,6 +197,7 @@ def change_once(value, old, new, label):
 def main():
     engine_path, engine, eng_eol = load('GameEngine.cpp')
     inventory_path, inventory, inv_eol = load('SCI_Inventory.cpp')
+    school_path, school, school_eol = load('SCI_SchoolMenu.cpp')
     bridge_h = ROOT / 'src' / 'APBridge.h'
     bridge_cpp = ROOT / 'src' / 'APBridge.cpp'
     if bridge_h.exists() or bridge_cpp.exists():
@@ -207,18 +235,23 @@ def main():
         '        DisplayPanels(itemId);\n'
         '        if (apGranted) APBridgeGrantFinished(itemId, 0);\n'
         '        break;\n    }\n    case 0x18:', 'Inventory receipt acknowledged')
-    inventory = change_once(inventory,
-        '        fread((char*)&g_SelectedItem_0046a6e4->objectFlags, 4, 1, (FILE*)fp);\n'
-        '    }\n}\n\n// Stubs (moved from stubs.cpp)',
-        '        fread((char*)&g_SelectedItem_0046a6e4->objectFlags, 4, 1, (FILE*)fp);\n'
-        '    }\n'
-        '    APBridgeStoryReloaded();\n'
-        '}\n\n// Stubs (moved from stubs.cpp)', 'Inventory load notification')
+    # A saved game's inventory handler is optional. Hook after all handlers loaded.
+    engine = change_once(engine,
+        '        h->Serialize(param);\n    }\n}',
+        '        h->Serialize(param);\n    }\n    APBridgeStoryReloaded();\n}',
+        'Completed game load notification')
+    school = change_once(school,
+        '    g_SchoolMenuActive_0046a190 = 1;\n',
+        '    g_SchoolMenuActive_0046a190 = 1;\n    APBridgeGameplayReady();\n',
+        'School gameplay-ready notification')
+    school = change_once(school, '#include "string.h"\n',
+        '#include "string.h"\n#include "APBridge.h"\n', 'School bridge include')
     engine_path.write_bytes(engine.replace('\n', eng_eol).encode('utf-8'))
+    school_path.write_bytes(school.replace('\n', school_eol).encode('utf-8'))
     inventory_path.write_bytes(inventory.replace('\n', inv_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v4 applied: session, inventory-load epoch and applied acknowledgments')
+    print('AP bridge v5 applied: world, ready, complete load and receipts')
 
 
 if __name__ == '__main__':
