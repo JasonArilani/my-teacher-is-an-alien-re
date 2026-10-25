@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Apply MTIAA bridge v6 to clean source (build-time only).
+"""Apply MTIAA bridge v7 to clean source (build-time only).
 
-v6 preserves v5 persistence and adds Radio, Tuning Fork and speech recipe.
+v7 preserves v5-v6 and adds Taste, Water and Awful Sound tests.
 Existing gameplay, checks, item IDs and original pickup flags remain as in v3.
 """
 from pathlib import Path
@@ -127,10 +127,19 @@ void APBridgeStoryReloaded() {
     APBridgeGameplayReady();
 }
 int APBridgeInterceptRecipeFlag(int stateId, int instruction) {
-    // QUEST19.MIS QUESTION2507 turns on GAMESTATE 77. Give a location
-    // check, not the vanilla recipe unlock. AP delivery unlocks it instead.
-    if (stateId != 77 || instruction != 0xF) return 0;
-    APBridgeSendCheck(1005);
+    // Original .MIS scripts trigger knowledge through GameState::SetFromAction.
+    // Chat QUEST19 questions: speech=2507, taste=2511, sound=2522.
+    // ROOM19 SEARCHSCREEN21_STATIC uses SET 1 rather than TURNON for water.
+    int locationId = 0;
+    if (instruction == 0xF) {
+        if (stateId == 77) locationId = 1005;
+        else if (stateId == 78) locationId = 1009;
+        else if (stateId == 79) locationId = 1011;
+    } else if (stateId == 76 && instruction == 0x13) {
+        locationId = 1013;
+    }
+    if (locationId == 0) return 0;
+    APBridgeSendCheck(locationId);
     return 1;
 }
 void APBridgeSendCheck(int locationId) {
@@ -175,7 +184,7 @@ void APBridgePoll() {
     command[0] = 0; world[0] = 0; session[0] = 0;
     if (sscanf(line, " %15s %64s %63s %d %d %d", command, world, session,
                &generation, &itemId, &seq) != 6 || strcmp(command, "GRANT") ||
-               itemId < 1 || itemId > 22 || seq <= 0) {
+               itemId < 1 || itemId > 25 || seq <= 0) {
         APBridgeAppend("debug.log", "INBOX_INVALID_FORMAT");
         return;
     }
@@ -187,14 +196,16 @@ void APBridgePoll() {
     if (remove(inboxPath) != 0) return;
     s_queuedGrantId = itemId;
     s_queuedSequence = seq;
-    if (itemId == 22) {
-        // Item 22 is a virtual AP recipe. The original game knowledge flag
-        // is 77; there is no INVENTOR item 22 and no new .MIS needed.
+    if (itemId >= 22 && itemId <= 25) {
+        // Virtual AP knowledge items. GameState indexes are defined in
+        // GAMESTAT.MIS: Water=76, Speech=77, Taste=78, Sound=79.
+        int stateId = (itemId == 22 ? 77 :
+                      itemId == 23 ? 78 : itemId == 24 ? 79 : 76);
         GameState* gs = g_GameState_0046aa30;
-        if (gs == 0 || gs->stateValues == 0 || gs->maxStates <= 77) {
+        if (gs == 0 || gs->stateValues == 0 || gs->maxStates <= stateId) {
             s_queuedGrantId = 0;
             s_queuedSequence = 0;
-            APBridgeAppend("debug.log", "RECIPE_GAMESTATE_NOT_READY");
+            APBridgeAppend("debug.log", "KNOWLEDGE_GAMESTATE_NOT_READY");
             return;
         }
         s_activeGrantId = s_queuedGrantId;
@@ -202,14 +213,16 @@ void APBridgePoll() {
         s_queuedGrantId = 0;
         s_queuedSequence = 0;
         {
-            int alreadyPresent = gs->stateValues[77] != 0;
-            gs->stateValues[77] = 1;
-            // If all three ingredients were already found, the recipe is the
-            // last requirement. Reuse the game's native AUTOCOMBINE panels.
-            GameEngine* engine = g_GameEngine_0046a6ec;
-            if (engine != 0) {
-                SCI_Inventory* inv = (SCI_Inventory*)engine->FindHandlerInList(0x1E);
-                if (inv != 0) inv->DisplayPanels(0);
+            int alreadyPresent = gs->stateValues[stateId] != 0;
+            gs->stateValues[stateId] = 1;
+            // Let the original game perform all three AUTOCOMBINE recipes.
+            // Water uses its flag directly and has no inventory recipe.
+            if (stateId != 76) {
+                GameEngine* engine = g_GameEngine_0046a6ec;
+                if (engine != 0) {
+                    SCI_Inventory* inv = (SCI_Inventory*)engine->FindHandlerInList(0x1E);
+                    if (inv != 0) inv->DisplayPanels(0);
+                }
             }
             APBridgeGrantFinished(itemId, alreadyPresent);
         }
@@ -257,15 +270,37 @@ def main():
         '        itemId = action->addressValue;\n        if (itemId == 0) break;\n\n'
         '        // AP ownership and the physical pickup are separate.\n'
         '        int apGranted = APBridgeConsumeGrant(itemId);\n'
-        '        if (!apGranted && (itemId == 5 || itemId == 7 || itemId == 2 || itemId == 8)) {\n'
+        '        // Real pickups generate location checks; AP grants own inventory separately.\n'
+        '        if (!apGranted && (itemId == 5 || itemId == 7 || itemId == 2 || itemId == 8 ||\n'
+        '                           itemId == 9 || itemId == 6 || itemId == 4 ||\n'
+        '                           itemId == 17 || itemId == 10)) {\n'
         '            T_Object* pickup = (T_Object*)FindItem(itemId);\n'
         '            if (pickup != 0) pickup->Reset();\n'
-        '            APBridgeSendCheck(itemId == 5 ? 1001 : itemId == 7 ? 1002 : itemId == 2 ? 1003 : 1004);\n'
+        '            int checkId = itemId == 5 ? 1001 : itemId == 7 ? 1002 :\n'
+        '                          itemId == 2 ? 1003 : itemId == 8 ? 1004 :\n'
+        '                          itemId == 9 ? 1006 : itemId == 6 ? 1007 :\n'
+        '                          itemId == 4 ? 1008 : itemId == 17 ? 1010 : 1012;\n'
+        '            APBridgeSendCheck(checkId);\n'
         '            break;\n'
         '        }\n'
-        '        // Completed Disrupt Speech Test represents consumed ingredients.\n'
-        '        if (apGranted && (itemId == 2 || itemId == 7 || itemId == 8) &&\n'
-        '            FindItemInList(18) != 0) {\n'
+        '        // A finished native test already contains the consumed AP ingredients.\n'
+        '        if (apGranted && (((itemId == 2 || itemId == 7 || itemId == 8) &&\n'
+        '                           FindItemInList(18) != 0) ||\n'
+        '                          ((itemId == 9 || itemId == 6 || itemId == 4) &&\n'
+        '                           FindItemInList(19) != 0) ||\n'
+        '                          ((itemId == 5 || itemId == 17) &&\n'
+        '                           FindItemInList(20) != 0) ||\n'
+        '                          (itemId == 10 && FindItemInList(13) != 0))) {\n'
+        '            APBridgeGrantFinished(itemId, 1);\n'
+        '            break;\n'
+        '        }\n'
+        '        // SOUND_TEST in ROOM07 sets flag 230 before deleting finished item 20.\n'
+        "        // Don't resurrect a one-use sound test on a post-use save load.\n"
+        '        if (apGranted && (itemId == 5 || itemId == 17) &&\n'
+        '            g_GameState_0046aa30 != 0 &&\n'
+        '            g_GameState_0046aa30->stateValues != 0 &&\n'
+        '            g_GameState_0046aa30->maxStates > 230 &&\n'
+        '            g_GameState_0046aa30->stateValues[230] != 0) {\n'
         '            APBridgeGrantFinished(itemId, 1);\n'
         '            break;\n'
         '        }\n'
@@ -305,7 +340,7 @@ def main():
     state_path.write_bytes(state.replace('\n', state_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v6 applied: five locations including recipe, persistence and receipts')
+    print('AP bridge v7 applied: 13 locations including all four tests, persistence and receipts')
 
 
 if __name__ == '__main__':
