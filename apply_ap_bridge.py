@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Apply MTIAA bridge v8 event expansion to clean source (build-time only).
+"""Apply MTIAA bridge v8.1 targeted item-use fixes to clean source (build-time only).
 
-v8 builds on v7.2 and adds six physical pickups and reliable game-state event checks.
+v8.1 retains the v8 event expansion and repairs reusable item returns and pod gun graphics.
 New Game, save/load, seed isolation and vanilla recipe behavior stay intact.
 """
 from pathlib import Path
@@ -18,6 +18,7 @@ void APBridgeStoryReloaded();
 void APBridgeNewGame();
 void APBridgeGameplayReady();
 int APBridgeInterceptRecipeFlag(int stateId, int instruction);
+int APBridgeHasInventoryItem(int itemId);
 #endif
 '''
 CPP = r'''#include "APBridge.h"
@@ -27,6 +28,7 @@ CPP = r'''#include "APBridge.h"
 #include "GameState.h"
 #include "GameEngine.h"
 #include "SCI_Inventory.h"
+#include "T_Object.h"
 #include "globals.h"
 
 void SendGameMessage(int, int, int, int, int, int, int, int, int, int);
@@ -45,6 +47,20 @@ static int s_haveBaseline = 0;
 static unsigned char s_sentEvent[1100];
 
 static void APBridgeWatchStates();
+
+// The original pod minigame tests OBJ011, the vanilla pickup flag, rather
+// than checking the actual shared inventory. AP grants deliberately do NOT
+// set pickup flags (the physical location must remain available as a check).
+// This helper lets SC_Pods temporarily interpret an AP-owned Ray Gun as
+// equipped while it parses cb_pods.mis, without consuming that location.
+int APBridgeHasInventoryItem(int itemId) {
+    GameEngine* engine = g_GameEngine_0046a6ec;
+    SCI_Inventory* inventory;
+    if (engine == 0) return 0;
+    inventory = (SCI_Inventory*)engine->FindHandlerInList(0x1E);
+    if (inventory != 0 && inventory->FindItemInList(itemId) != 0) return 1;
+    return g_SelectedItem_0046a6e4 != 0 && g_SelectedItem_0046a6e4->itemId == itemId;
+}
 
 
 // Source-backed state transitions from GAMESTAT.MIS and associated ROOM*.MIS.
@@ -337,6 +353,7 @@ def main():
     school_path, school, school_eol = load('SCI_SchoolMenu.cpp')
     state_path, state, state_eol = load('GameState.cpp')
     newgame_path, newgame, newgame_eol = load('SC_DuctNav.cpp')
+    pods_path, pods, pods_eol = load('SC_Pods.cpp')
     bridge_h = ROOT / 'src' / 'APBridge.h'
     bridge_cpp = ROOT / 'src' / 'APBridge.cpp'
     if bridge_h.exists() or bridge_cpp.exists():
@@ -355,8 +372,12 @@ def main():
         '        itemId = action->addressValue;\n        if (itemId == 0) break;\n\n'
         '        // AP ownership and the physical pickup are separate.\n'
         '        int apGranted = APBridgeConsumeGrant(itemId);\n'
+        '        // The engine also INSERTs an item to return it after USE/PUT BACK.\n'
+        '        // This is NOT a fresh location pickup. Let it return normally.\n'
+        '        int apReturning = g_SelectedItem_0046a6e4 != 0 &&\n'
+        '                          g_SelectedItem_0046a6e4->itemId == itemId;\n' 
         '        // Real pickups generate location checks; AP grants own inventory separately.\n'
-        '        if (!apGranted && (itemId == 5 || itemId == 7 || itemId == 2 || itemId == 8 ||\n'
+        '        if (!apGranted && !apReturning && (itemId == 5 || itemId == 7 || itemId == 2 || itemId == 8 ||\n'
         '                           itemId == 9 || itemId == 6 || itemId == 4 ||\n'
         '                           itemId == 17 || itemId == 10 ||\n'
         '                           itemId == 3 || itemId == 14 || itemId == 21 ||\n'
@@ -401,12 +422,35 @@ def main():
     inventory = change_once(inventory,
         '        item = (T_Object*)FindItem(itemId);\n        item->Reset();',
         '        item = (T_Object*)FindItem(itemId);\n'
-        '        if (!apGranted) item->Reset();', 'Inventory pickup flag')
+        '        if (!apGranted && !apReturning) item->Reset();', 'Inventory pickup flag')
     inventory = change_once(inventory,
         '        DisplayPanels(itemId);\n        break;\n    }\n    case 0x18:',
         '        DisplayPanels(itemId);\n'
         '        if (apGranted) APBridgeGrantFinished(itemId, 0);\n'
         '        break;\n    }\n    case 0x18:', 'Inventory receipt acknowledged')
+    pods = change_once(pods, '#include "globals.h"\n',
+        '#include "globals.h"\n#include "APBridge.h"\n', 'Pod minigame bridge include')
+    pods = change_once(pods,
+        '    ParseFile(this, "mis\\\\cb_Pods.mis", (char*)0);\n'
+        '    InitCombatScreen(g_CombatEngine_0046ae78);',
+        '    // cb_pods.mis chooses visible or invisible attack orbs from OBJ011.\n'
+        '    // Temporarily mirror actual AP inventory at parse-time, leaving\n'
+        '    // OBJ011 unchanged afterward so the physical Ray Gun check remains.\n'
+        '    GameState* apState = g_GameState_0046aa30;\n'
+        '    int apGunIdx = -1;\n'
+        '    int apTemporaryGun = 0;\n'
+        '    if (apState != 0 && apState->stateValues != 0) {\n'
+        '        apGunIdx = apState->FindState("OBJ011");\n'
+        '        if (apGunIdx >= 0 && apGunIdx < apState->maxStates &&\n'
+        '            apState->stateValues[apGunIdx] == 0 && APBridgeHasInventoryItem(11)) {\n'
+        '            apState->stateValues[apGunIdx] = 1;\n'
+        '            apTemporaryGun = 1;\n'
+        '        }\n'
+        '    }\n'
+        '    ParseFile(this, "mis\\\\cb_Pods.mis", (char*)0);\n'
+        '    InitCombatScreen(g_CombatEngine_0046ae78);\n'
+        '    if (apTemporaryGun) apState->stateValues[apGunIdx] = 0;',
+        'AP equipment pod parse')
     state = change_once(state, '#include "GameState.h"\n',
         '#include "GameState.h"\n#include "APBridge.h"\n', 'Gamestate bridge include')
     state = change_once(state,
@@ -438,9 +482,10 @@ def main():
     inventory_path.write_bytes(inventory.replace('\n', inv_eol).encode('utf-8'))
     state_path.write_bytes(state.replace('\n', state_eol).encode('utf-8'))
     newgame_path.write_bytes(newgame.replace('\n', newgame_eol).encode('utf-8'))
+    pods_path.write_bytes(pods.replace('\n', pods_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v8 applied: v7.2 plus inventory and event checks')
+    print('AP bridge v8.1 applied: v8 events plus reusable item returns and Ray Gun pod visuals')
 
 
 if __name__ == '__main__':
