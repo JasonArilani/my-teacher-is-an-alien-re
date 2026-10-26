@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Apply MTIAA bridge v8.1 targeted item-use fixes to clean source (build-time only).
+"""MTIAA bridge v8.2: v8.1 fixes plus duct entry and successful ending checks.
 
-v8.1 retains the v8 event expansion and repairs reusable item returns and pod gun graphics.
-New Game, save/load, seed isolation and vanilla recipe behavior stay intact.
+Apply at build-time to a clean reconstruction checkout.
 """
 from pathlib import Path
 
@@ -19,6 +18,7 @@ void APBridgeNewGame();
 void APBridgeGameplayReady();
 int APBridgeInterceptRecipeFlag(int stateId, int instruction);
 int APBridgeHasInventoryItem(int itemId);
+void APBridgeOnFocusChange(int toType, int toValue, int fromType, int fromValue);
 #endif
 '''
 CPP = r'''#include "APBridge.h"
@@ -72,6 +72,32 @@ static void APBridgeEvent(int id) {
     s_sentEvent[id] = 1;
     APBridgeSendCheck(id);
 }
+// Native handler focus-change events not represented by reliable GAMESTAT flags.
+// The original scripts use handler 65 for duct navigation, and the successful
+// Peter/Duncan/Susan finales all queue cinematic 3202 or 3203 FROM DETENTION 4.
+// Failed finales use separate cutscenes and DETENTION 5.
+void APBridgeOnFocusChange(int toType, int toValue, int fromType, int fromValue) {
+    GameState* gs;
+    int kid;
+    if (toType == 65 && toValue == 1) {
+        // Practice-room challenges are not ordinary school exploration.
+        gs = g_GameState_0046aa30;
+        if (gs != 0 && gs->stateValues != 0 && gs->maxStates > 112 &&
+            gs->stateValues[112] == 0 &&
+            gs->stateValues[60] >= 1 && gs->stateValues[60] <= 20)
+            APBridgeEvent(1022);
+        return;
+    }
+    if (toType != 3 || (toValue != 3202 && toValue != 3203) ||
+        fromType != 44 || fromValue != 4) return;
+    gs = g_GameState_0046aa30;
+    if (gs == 0 || gs->stateValues == 0 || gs->maxStates <= 99) return;
+    kid = gs->stateValues[99];
+    if (kid == 0) APBridgeEvent(1045);      // Peter - PZ_CRYSTAL
+    else if (kid == 2) APBridgeEvent(1046); // Duncan - CB_GAUNTLET
+    else if (kid == 1) APBridgeEvent(1047); // Susan - QUEST26
+}
+
 static void APBridgeWatchStates() {
     GameState* gs = g_GameState_0046aa30;
     int i; int* now;
@@ -86,7 +112,8 @@ static void APBridgeWatchStates() {
     // chronological event, NOT a virtual Alien Device inventory grant.
     if (s_lastState[60] == 1 && now[60] == 2) APBridgeEvent(1020);
     if (s_lastState[107] == 0 && now[107] != 0) APBridgeEvent(1021); // Yahoo puzzle
-    if (s_lastState[225] == 0 && now[225] != 0) APBridgeEvent(1022); // ducts
+    // Duct entry is emitted on focus transition into COMBAT_DUCTNAV (handler 65).
+    // BEEN_IN_DUCTWORK is set after returning to certain rooms, too late.
     // ROOM24 sets S_BEEN_SHIP unconditionally (despite the Susan prefix).
     if (s_lastState[172] == 0 && now[172] != 0) APBridgeEvent(1023);
     if (s_lastState[102] == 0 && now[102] != 0) APBridgeEvent(1024); // fan
@@ -457,6 +484,26 @@ def main():
         '    switch (action->instruction) {\n',
         '    if (APBridgeInterceptRecipeFlag(idx, action->instruction)) return;\n'
         '    switch (action->instruction) {\n', 'Recipe flag interception')
+    # Hook actual focus-change completion, not a late/reused state flag.
+    # Both success endings and normal duct entry route through this handler.
+    engine = change_once(engine,
+        '    handler = (Handler*)m_activeHandler;\n'
+        '    if (handler != 0) {\n'
+        '        handler->Init(msg);\n'
+        '    } else {\n'
+        '        ShowError("missing modual %d", action->addressType);\n'
+        '    }\n'
+        '}\n',
+        '    handler = (Handler*)m_activeHandler;\n'
+        '    if (handler != 0) {\n'
+        '        handler->Init(msg);\n'
+        '        APBridgeOnFocusChange(action->addressType, action->addressValue,\n'
+        '                              action->fromType, action->fromValue);\n'
+        '    } else {\n'
+        '        ShowError("missing modual %d", action->addressType);\n'
+        '    }\n'
+        '}\n',
+        'Focus transition and winning ending notification')
     # A saved game's inventory handler is optional. Hook after all handlers loaded.
     engine = change_once(engine,
         '        h->Serialize(param);\n    }\n}',
@@ -485,7 +532,7 @@ def main():
     pods_path.write_bytes(pods.replace('\n', pods_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v8.1 applied: v8 events plus reusable item returns and Ray Gun pod visuals')
+    print('AP bridge v8.2 applied: v8.1 item fixes plus duct entry and ending checks')
 
 
 if __name__ == '__main__':
