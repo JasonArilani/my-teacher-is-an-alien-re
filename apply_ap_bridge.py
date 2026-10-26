@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Apply MTIAA bridge v7.2 to clean source (build-time only).
+"""Apply MTIAA bridge v8 event expansion to clean source (build-time only).
 
-v7.2 preserves working v7.1 behavior and adds in-process New Game reconciliation.
-No change to item pool, location IDs, original pickup flags, or vanilla save behavior.
+v8 builds on v7.2 and adds six physical pickups and reliable game-state event checks.
+New Game, save/load, seed isolation and vanilla recipe behavior stay intact.
 """
 from pathlib import Path
 
@@ -40,6 +40,71 @@ static int s_queuedGrantId = 0;
 static int s_queuedSequence = 0;
 static int s_activeGrantId = 0;
 static int s_activeSequence = 0;
+static int s_lastState[450];
+static int s_haveBaseline = 0;
+static unsigned char s_sentEvent[1100];
+
+static void APBridgeWatchStates();
+
+
+// Source-backed state transitions from GAMESTAT.MIS and associated ROOM*.MIS.
+// This watcher is intentionally conservative: baseline state at start/load is
+// not awarded as newly completed. Pending native forcefield/endgame handlers
+// are excluded rather than approximated by unrelated flags.
+static void APBridgeEvent(int id) {
+    if (id <= 0 || id >= 1100 || s_sentEvent[id]) return;
+    s_sentEvent[id] = 1;
+    APBridgeSendCheck(id);
+}
+static void APBridgeWatchStates() {
+    GameState* gs = g_GameState_0046aa30;
+    int i; int* now;
+    if (gs == 0 || gs->stateValues == 0 || gs->maxStates < 450) return;
+    now = gs->stateValues;
+    if (!s_haveBaseline) {
+        for (i=0; i<450; ++i) s_lastState[i] = now[i];
+        s_haveBaseline = 1;
+        return;
+    }
+    // Earliest scripted cutscene after Monday Period 1. This detects the
+    // chronological event, NOT a virtual Alien Device inventory grant.
+    if (s_lastState[60] == 1 && now[60] == 2) APBridgeEvent(1020);
+    if (s_lastState[107] == 0 && now[107] != 0) APBridgeEvent(1021); // Yahoo puzzle
+    if (s_lastState[225] == 0 && now[225] != 0) APBridgeEvent(1022); // ducts
+    // ROOM24 sets S_BEEN_SHIP unconditionally (despite the Susan prefix).
+    if (s_lastState[172] == 0 && now[172] != 0) APBridgeEvent(1023);
+    if (s_lastState[102] == 0 && now[102] != 0) APBridgeEvent(1024); // fan
+    if (s_lastState[35] != 0 && now[35] == 0) APBridgeEvent(1025); // rats
+    if (s_lastState[101] != 1 && now[101] == 1) APBridgeEvent(1026); // left bridge
+    if (s_lastState[101] != 2 && now[101] == 2) APBridgeEvent(1027); // right bridge
+    if (s_lastState[109] == 0 && now[109] != 0) APBridgeEvent(1028); // slime
+    if (s_lastState[216] == 0 && now[216] != 0) APBridgeEvent(1029);
+    if (s_lastState[215] == 0 && now[215] != 0) APBridgeEvent(1030);
+    if (s_lastState[232] == 0 && now[232] != 0) APBridgeEvent(1031);
+    if (s_lastState[227] == 0 && now[227] != 0) APBridgeEvent(1032);
+    if (s_lastState[235] == 0 && now[235] == now[92] && now[235] >= 1 && now[235] <= 3)
+        APBridgeEvent(1033);
+    if (s_lastState[104] == 0 && now[104] != 0) APBridgeEvent(1034);
+    if (s_lastState[105] == 0 && now[105] != 0) APBridgeEvent(1035);
+    if (s_lastState[106] == 0 && now[106] != 0) APBridgeEvent(1036);
+    if (s_lastState[173] == 0 && now[173] != 0) APBridgeEvent(1037);
+    if ((s_lastState[129] == 0 && now[129] != 0) ||
+        (s_lastState[188] == 0 && now[188] != 0)) APBridgeEvent(1038);
+    // Captivity flags 93..98. The game may rescue from a spaceship door by
+    // changing 1 -> 0; prevents are handled through their transient pod win.
+    for (i=93; i<=98; ++i)
+        if (s_lastState[i] == 1 && now[i] == 0) APBridgeEvent(1039 + i-93);
+    // The pod win result is only meaningful when associated with a student.
+    // DETENTION.MIS HANDLEPOD is invoked on entering periods 8/12/15/17,
+    // so the minigame is performed in periods 7/11/14/16 respectively.
+    if (s_lastState[108] == 0 && now[108] == 1) {
+        if (now[60] == 7) APBridgeEvent(1041);  // Wendy
+        else if (now[60] == 11) APBridgeEvent(1042); // Jack
+        else if (now[60] == 14) APBridgeEvent(1043); // Stacy
+        else if (now[60] == 16) APBridgeEvent(1044); // Orville
+    }
+    for (i=0; i<450; ++i) s_lastState[i] = now[i];
+}
 
 static int APBridgePath(char* output, const char* leaf) {
     DWORD length = GetModuleFileNameA(NULL, output, MAX_PATH);
@@ -108,6 +173,10 @@ void APBridgeGameplayReady() {
     APBridgeEnsureSession();
     if (!s_bound || s_worldConflict || s_ready) return;
     s_ready = 1;
+    // Establish an initial snapshot. Loading an older save is not by itself
+    // a new accomplishment; only changes occurring during gameplay count.
+    s_haveBaseline = 0;
+    APBridgeWatchStates();
     sprintf(line, "READY %s %s %d", s_world, s_session, s_generation);
     APBridgeAppend("events.log", line);
 }
@@ -120,6 +189,7 @@ static void APBridgeResetGeneration(const char* eventType) {
     if (!s_bound || s_worldConflict) return;
     ++s_generation;
     s_ready = 0;
+    s_haveBaseline = 0;
     s_queuedGrantId = 0;
     s_queuedSequence = 0;
     s_activeGrantId = 0;
@@ -187,6 +257,7 @@ void APBridgePoll() {
     int itemId = 0, seq = 0, generation = 0;
     FILE* input;
     APBridgeEnsureSession();
+    if (s_bound && s_ready && !s_worldConflict) APBridgeWatchStates();
     if (!s_bound || !s_ready || s_worldConflict || s_queuedGrantId || s_activeGrantId) return;
     if (!APBridgePath(inboxPath, "inbox.txt")) return;
     input = fopen(inboxPath, "rb");
@@ -197,7 +268,7 @@ void APBridgePoll() {
     command[0] = 0; world[0] = 0; session[0] = 0;
     if (sscanf(line, " %15s %64s %63s %d %d %d", command, world, session,
                &generation, &itemId, &seq) != 6 || strcmp(command, "GRANT") ||
-               itemId < 1 || itemId > 25 || seq <= 0) {
+               itemId < 1 || itemId > 31 || seq <= 0) {
         APBridgeAppend("debug.log", "INBOX_INVALID_FORMAT");
         return;
     }
@@ -287,13 +358,18 @@ def main():
         '        // Real pickups generate location checks; AP grants own inventory separately.\n'
         '        if (!apGranted && (itemId == 5 || itemId == 7 || itemId == 2 || itemId == 8 ||\n'
         '                           itemId == 9 || itemId == 6 || itemId == 4 ||\n'
-        '                           itemId == 17 || itemId == 10)) {\n'
+        '                           itemId == 17 || itemId == 10 ||\n'
+        '                           itemId == 3 || itemId == 14 || itemId == 21 ||\n'
+        '                           itemId == 12 || itemId == 11 || itemId == 1)) {\n'
         '            T_Object* pickup = (T_Object*)FindItem(itemId);\n'
         '            if (pickup != 0) pickup->Reset();\n'
         '            int checkId = itemId == 5 ? 1001 : itemId == 7 ? 1002 :\n'
         '                          itemId == 2 ? 1003 : itemId == 8 ? 1004 :\n'
         '                          itemId == 9 ? 1006 : itemId == 6 ? 1007 :\n'
-        '                          itemId == 4 ? 1008 : itemId == 17 ? 1010 : 1012;\n'
+        '                          itemId == 4 ? 1008 : itemId == 17 ? 1010 :\n'
+        '                          itemId == 10 ? 1012 : itemId == 3 ? 1014 :\n'
+        '                          itemId == 14 ? 1015 : itemId == 21 ? 1016 :\n'
+        '                          itemId == 12 ? 1017 : itemId == 11 ? 1018 : 1019;\n'
         '            APBridgeSendCheck(checkId);\n'
         '            break;\n'
         '        }\n'
@@ -364,7 +440,7 @@ def main():
     newgame_path.write_bytes(newgame.replace('\n', newgame_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v7.2 applied: v7.1 checks plus in-process New Game synchronization')
+    print('AP bridge v8 applied: v7.2 plus inventory and event checks')
 
 
 if __name__ == '__main__':
