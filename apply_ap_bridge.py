@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Apply MTIAA bridge v7 to clean source (build-time only).
+"""Apply MTIAA bridge v7.2 to clean source (build-time only).
 
-v7 preserves v5-v6 and adds Taste, Water and Awful Sound tests.
-Existing gameplay, checks, item IDs and original pickup flags remain as in v3.
+v7.2 preserves working v7.1 behavior and adds in-process New Game reconciliation.
+No change to item pool, location IDs, original pickup flags, or vanilla save behavior.
 """
 from pathlib import Path
 
@@ -15,6 +15,7 @@ void APBridgeSendCheck(int locationId);
 int APBridgeConsumeGrant(int itemId);
 void APBridgeGrantFinished(int itemId, int alreadyPresent);
 void APBridgeStoryReloaded();
+void APBridgeNewGame();
 void APBridgeGameplayReady();
 int APBridgeInterceptRecipeFlag(int stateId, int instruction);
 #endif
@@ -110,7 +111,10 @@ void APBridgeGameplayReady() {
     sprintf(line, "READY %s %s %d", s_world, s_session, s_generation);
     APBridgeAppend("events.log", line);
 }
-void APBridgeStoryReloaded() {
+// Invalidate delivery acknowledgments whenever the original game replaces
+// its inventory. New Game needs a separate event because it does NOT use
+// GameEngine::Serialize, unlike Load Game.
+static void APBridgeResetGeneration(const char* eventType) {
     char line[200];
     APBridgeEnsureSession();
     if (!s_bound || s_worldConflict) return;
@@ -120,11 +124,20 @@ void APBridgeStoryReloaded() {
     s_queuedSequence = 0;
     s_activeGrantId = 0;
     s_activeSequence = 0;
-    sprintf(line, "LOAD %s %s %d", s_world, s_session, s_generation);
+    sprintf(line, "%s %s %s %d", eventType, s_world, s_session, s_generation);
     APBridgeAppend("events.log", line);
+}
+void APBridgeStoryReloaded() {
+    APBridgeResetGeneration("LOAD");
     APBridgeAppend("debug.log", "GAME_LOAD_COMPLETE_V5");
     // GameEngine::Serialize finished loading all the handlers.
     APBridgeGameplayReady();
+}
+void APBridgeNewGame() {
+    // Called after InitNewGame has removed old handlers and created new state.
+    // SchoolMenu::Init will emit READY after the new school scene begins.
+    APBridgeResetGeneration("NEWGAME");
+    APBridgeAppend("debug.log", "NEW_GAME_STATE_RESET_V7_2");
 }
 int APBridgeInterceptRecipeFlag(int stateId, int instruction) {
     // Original .MIS scripts trigger knowledge through GameState::SetFromAction.
@@ -252,6 +265,7 @@ def main():
     inventory_path, inventory, inv_eol = load('SCI_Inventory.cpp')
     school_path, school, school_eol = load('SCI_SchoolMenu.cpp')
     state_path, state, state_eol = load('GameState.cpp')
+    newgame_path, newgame, newgame_eol = load('SC_DuctNav.cpp')
     bridge_h = ROOT / 'src' / 'APBridge.h'
     bridge_cpp = ROOT / 'src' / 'APBridge.cpp'
     if bridge_h.exists() or bridge_cpp.exists():
@@ -334,13 +348,23 @@ def main():
         'School gameplay-ready notification')
     school = change_once(school, '#include "string.h"\n',
         '#include "string.h"\n#include "APBridge.h"\n', 'School bridge include')
+    # The save/load menu module creates a completely fresh GameState and
+    # inventory during New Game; it never calls GameEngine::Serialize.
+    newgame = change_once(newgame, '#include "GameEngine.h"\n',
+        '#include "GameEngine.h"\n#include "APBridge.h"\n', 'New Game bridge include')
+    newgame = change_once(newgame,
+        '            InitNewGame();\n            SendGameMessage(3, 10, g_PendingAction_00472d58.addressType,',
+        '            InitNewGame();\n            APBridgeNewGame();\n'
+        '            SendGameMessage(3, 10, g_PendingAction_00472d58.addressType,',
+        'New Game completed notification')
     engine_path.write_bytes(engine.replace('\n', eng_eol).encode('utf-8'))
     school_path.write_bytes(school.replace('\n', school_eol).encode('utf-8'))
     inventory_path.write_bytes(inventory.replace('\n', inv_eol).encode('utf-8'))
     state_path.write_bytes(state.replace('\n', state_eol).encode('utf-8'))
+    newgame_path.write_bytes(newgame.replace('\n', newgame_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v7 applied: 13 locations including all four tests, persistence and receipts')
+    print('AP bridge v7.2 applied: v7.1 checks plus in-process New Game synchronization')
 
 
 if __name__ == '__main__':
