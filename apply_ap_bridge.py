@@ -89,7 +89,7 @@ int APBridgeBeginItemEvidence(int itemId, const char* flagName) {
     if (!s_bound || !s_ready || s_worldConflict || flagName == 0) return -1;
     GameState* gs = g_GameState_0046aa30;
     if (gs == 0 || gs->stateValues == 0) return -1;
-    int idx = gs->FindState(flagName);
+    int idx = gs->FindState(const_cast<char*>(flagName));
     if (idx < 0 || idx >= gs->maxStates) return -1;
     int previous = gs->stateValues[idx];
     gs->stateValues[idx] = APBridgeHasInventoryItem(itemId) ? 1 : 0;
@@ -99,7 +99,7 @@ void APBridgeEndItemEvidence(int previousValue, const char* flagName) {
     if (previousValue < 0 || flagName == 0) return;
     GameState* gs = g_GameState_0046aa30;
     if (gs == 0 || gs->stateValues == 0) return;
-    int idx = gs->FindState(flagName);
+    int idx = gs->FindState(const_cast<char*>(flagName));
     if (idx >= 0 && idx < gs->maxStates)
         gs->stateValues[idx] = previousValue;
 }
