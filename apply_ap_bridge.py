@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MTIAA v9 Progressive Period mechanics proof of concept, based on the tested character-unlock patch.
+"""MTIAA v9 stabilization prototype, based on tested character and period mechanics.
 
 Apply at build-time to a clean reconstruction checkout.
 """
@@ -18,6 +18,9 @@ void APBridgeNewGame();
 void APBridgeGameplayReady();
 int APBridgeInterceptRecipeFlag(int stateId, int instruction);
 int APBridgeHasInventoryItem(int itemId);
+int APBridgeBeginItemEvidence(int itemId, const char* flagName);
+void APBridgeEndItemEvidence(int previousValue, const char* flagName);
+void APBridgeLogMaintenanceSource(int apGranted, int apReturning);
 int APBridgeCharacterUnlocked(int characterIndex);
 int APBridgeCurrentCharacterUnlocked();
 int APBridgeCurrentCharacterCanGo();
@@ -75,6 +78,39 @@ int APBridgeHasInventoryItem(int itemId) {
     return g_SelectedItem_0046a6e4 != 0 && g_SelectedItem_0046a6e4->itemId == itemId;
 }
 
+
+// Original pickups use OBJ flags as "picked up" markers. Dialogues and
+// combat can unfortunately mistake those markers for AP item ownership.
+// Temporarily substitute the real inventory state ONLY while the target
+// script is being parsed. The old OBJ value must be restored so the vanilla
+// pickup remains an Archipelago location check.
+// -1 means no override was applied (unbound game or missing flag).
+int APBridgeBeginItemEvidence(int itemId, const char* flagName) {
+    if (!s_bound || !s_ready || s_worldConflict || flagName == 0) return -1;
+    GameState* gs = g_GameState_0046aa30;
+    if (gs == 0 || gs->stateValues == 0) return -1;
+    int idx = gs->FindState(flagName);
+    if (idx < 0 || idx >= gs->maxStates) return -1;
+    int previous = gs->stateValues[idx];
+    gs->stateValues[idx] = APBridgeHasInventoryItem(itemId) ? 1 : 0;
+    return previous;
+}
+void APBridgeEndItemEvidence(int previousValue, const char* flagName) {
+    if (previousValue < 0 || flagName == 0) return;
+    GameState* gs = g_GameState_0046aa30;
+    if (gs == 0 || gs->stateValues == 0) return;
+    int idx = gs->FindState(flagName);
+    if (idx >= 0 && idx < gs->maxStates)
+        gs->stateValues[idx] = previousValue;
+}
+
+
+void APBridgeLogMaintenanceSource(int apGranted, int apReturning) {
+    if (!s_bound || !s_ready || s_worldConflict) return;
+    APBridgeAppend("debug.log", apGranted ? "AP_KEY_SOURCE GRANT" :
+                   apReturning ? "AP_KEY_SOURCE RETURN" :
+                                 "AP_KEY_SOURCE PICKUP");
+}
 
 // Called only from the school menu. Indices are Peter=0, Susan=1,
 // Duncan=2 as proven by SKOOL.MIS CHAR entries and the existing bridge.
@@ -193,6 +229,26 @@ static void APBridgeEvent(int id) {
 void APBridgeOnFocusChange(int toType, int toValue, int fromType, int fromValue) {
     GameState* gs;
     int kid;
+    // Narrow diagnostic for the cutscene after Monday Period 1. We know
+    // the old 1->2 PERIOD watcher is too late when the period gate blocks.
+    // The exact cinematic ID must be identified from a real game trace
+    // before we move location 1020; no guessed check is emitted here.
+    if (toType == 3) {
+        GameState* traceGs = g_GameState_0046aa30;
+        if (traceGs != 0 && traceGs->stateValues != 0) {
+            int periodIdx = traceGs->FindState("PERIOD");
+            if (periodIdx >= 0 && periodIdx < traceGs->maxStates &&
+                traceGs->stateValues[periodIdx] >= 1 &&
+                traceGs->stateValues[periodIdx] <= 2) {
+                char entry[130];
+                sprintf(entry,
+                    "AP_EARLY_CINEMATIC id=%d period=%d from=%d/%d",
+                    toValue, traceGs->stateValues[periodIdx],
+                    fromType, fromValue);
+                APBridgeAppend("debug.log", entry);
+            }
+        }
+    }
     if (toType == 65 && toValue == 1) {
         // Practice-room challenges are not ordinary school exploration.
         gs = g_GameState_0046aa30;
@@ -548,6 +604,7 @@ def main():
     newgame_path, newgame, newgame_eol = load('SC_DuctNav.cpp')
     pods_path, pods, pods_eol = load('SC_Pods.cpp')
     detention_path, detention, detention_eol = load('SC_Detention.cpp')
+    question_path, question, quest_eol = load('SC_Question.cpp')
     bridge_h = ROOT / 'src' / 'APBridge.h'
     bridge_cpp = ROOT / 'src' / 'APBridge.cpp'
     if bridge_h.exists() or bridge_cpp.exists():
@@ -570,6 +627,9 @@ def main():
         '        // This is NOT a fresh location pickup. Let it return normally.\n'
         '        int apReturning = g_SelectedItem_0046a6e4 != 0 &&\n'
         '                          g_SelectedItem_0046a6e4->itemId == itemId;\n' 
+        '        // Diagnose any AP grant / pickup confusion for Maintenance Key.\n'
+        '        // Logging is source-specific and does not itself award a check.\n'
+        '        if (itemId == 3) APBridgeLogMaintenanceSource(apGranted, apReturning);\n'
         '        // Real pickups generate location checks; AP grants own inventory separately.\n'
         '        if (!apGranted && !apReturning && (itemId == 5 || itemId == 7 || itemId == 2 || itemId == 8 ||\n'
         '                           itemId == 9 || itemId == 6 || itemId == 4 ||\n'
@@ -628,23 +688,25 @@ def main():
         '    ParseFile(this, "mis\\\\cb_Pods.mis", (char*)0);\n'
         '    InitCombatScreen(g_CombatEngine_0046ae78);',
         '    // cb_pods.mis chooses visible or invisible attack orbs from OBJ011.\n'
-        '    // Temporarily mirror actual AP inventory at parse-time, leaving\n'
-        '    // OBJ011 unchanged afterward so the physical Ray Gun check remains.\n'
-        '    GameState* apState = g_GameState_0046aa30;\n'
-        '    int apGunIdx = -1;\n'
-        '    int apTemporaryGun = 0;\n'
-        '    if (apState != 0 && apState->stateValues != 0) {\n'
-        '        apGunIdx = apState->FindState("OBJ011");\n'
-        '        if (apGunIdx >= 0 && apGunIdx < apState->maxStates &&\n'
-        '            apState->stateValues[apGunIdx] == 0 && APBridgeHasInventoryItem(11)) {\n'
-        '            apState->stateValues[apGunIdx] = 1;\n'
-        '            apTemporaryGun = 1;\n'
-        '        }\n'
-        '    }\n'
+        '    // Mirror actual AP inventory in BOTH directions.\n'
+        '    int apGunBefore = APBridgeBeginItemEvidence(11, "OBJ011");\n'
         '    ParseFile(this, "mis\\\\cb_Pods.mis", (char*)0);\n'
         '    InitCombatScreen(g_CombatEngine_0046ae78);\n'
-        '    if (apTemporaryGun) apState->stateValues[apGunIdx] = 0;',
+        '    APBridgeEndItemEvidence(apGunBefore, "OBJ011");',
         'AP equipment pod parse')
+    question = change_once(question, '#include "GameState.h"\n',
+        '#include "GameState.h"\n#include "APBridge.h"\n',
+        'Reporter dialogue bridge include')
+    question = change_once(question,
+        '    ParseFile(this, questFile, "[QUESTION%d]", questionId);',
+        '    // Only quest06.mis contains the reporter evidence questions.\n'
+        '    // Do not change OBJ021 globally: it controls vanilla list pickup.\n'
+        '    int listFlagBefore = -1;\n'
+        '    if (strstr(questFile, "quest06.mis") != 0)\n'
+        '        listFlagBefore = APBridgeBeginItemEvidence(21, "OBJ021");\n'
+        '    ParseFile(this, questFile, "[QUESTION%d]", questionId);\n'
+        '    APBridgeEndItemEvidence(listFlagBefore, "OBJ021");',
+        'Reporter evidence list script scope')
     detention = change_once(detention, '#include "GameState.h"\n',
                             '#include "GameState.h"\n#include "APBridge.h"\n',
                             'Detention bridge include')
@@ -737,9 +799,10 @@ def main():
     newgame_path.write_bytes(newgame.replace('\n', newgame_eol).encode('utf-8'))
     pods_path.write_bytes(pods.replace('\n', pods_eol).encode('utf-8'))
     detention_path.write_bytes(detention.replace('\n', detention_eol).encode('utf-8'))
+    question_path.write_bytes(question.replace('\n', quest_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v9 Progressive Period PoC applied (character unlocks retained)')
+    print('AP bridge v9 stabilization applied (item ownership, maintenance diagnostics, cinematic tracing)')
 
 
 if __name__ == '__main__':
