@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MTIAA bridge v8.2: v8.1 fixes plus duct entry and successful ending checks.
+"""MTIAA v9 Progressive Period mechanics proof of concept, based on the tested character-unlock patch.
 
 Apply at build-time to a clean reconstruction checkout.
 """
@@ -21,6 +21,8 @@ int APBridgeHasInventoryItem(int itemId);
 int APBridgeCharacterUnlocked(int characterIndex);
 int APBridgeCurrentCharacterUnlocked();
 int APBridgeCurrentCharacterCanGo();
+int APBridgeMaxPeriod();
+int APBridgeCanEnterNextPeriod();
 void APBridgePrepareChoiceMenu();
 void APBridgeOnFocusChange(int toType, int toValue, int fromType, int fromValue);
 #endif
@@ -52,6 +54,9 @@ static unsigned char s_sentEvent[1100];
 // AP-only character access. Bit 0 Peter, bit 1 Susan, bit 2 Duncan.
 // Peter starts enabled in this proof of concept; story flags are untouched.
 static int s_charUnlockMask = 1;
+// Replayed on every New Game or Load from uniquely sequenced AP receipts.
+static int s_progressivePeriods = 0;
+static int s_lastPeriodBlocked = -1;
 
 static void APBridgeWatchStates();
 static void APBridgeAppend(const char* filename, const char* line);
@@ -141,6 +146,37 @@ void APBridgePrepareChoiceMenu() {
     }
 }
 
+// Virtual Progressive Period item (bridge ID 29). First school period is
+// free; each received copy permits one additional period, up to period 20.
+int APBridgeMaxPeriod() {
+    int count = s_progressivePeriods;
+    if (count < 0) count = 0;
+    if (count > 19) count = 19;
+    return 1 + count;
+}
+
+// Called at the beginning of SC_Detention::ResetAnimations, before either
+// MOVE_TO_NEXT_PERIOD or PERIOD_N can run. No changed story flags here.
+// Return 1 for vanilla/offline games, or when the next period is unlocked.
+int APBridgeCanEnterNextPeriod() {
+    if (!s_bound || !s_ready || s_worldConflict) return 1;
+    GameState* gs = g_GameState_0046aa30;
+    if (gs == 0 || gs->stateValues == 0) return 1;
+    int index = gs->FindState("PERIOD");
+    if (index < 0 || index >= gs->maxStates) return 1;
+    int period = gs->stateValues[index];
+    if (period < 1 || period >= 20) return 1;
+    if (period + 1 <= APBridgeMaxPeriod()) return 1;
+    if (s_lastPeriodBlocked != period) {
+        char entry[100];
+        sprintf(entry, "AP_PERIOD_LOCKED current=%d next=%d max=%d", period,
+                period + 1, APBridgeMaxPeriod());
+        APBridgeAppend("debug.log", entry);
+        s_lastPeriodBlocked = period;
+    }
+    return 0;
+}
+
 // Source-backed state transitions from GAMESTAT.MIS and associated ROOM*.MIS.
 // This watcher is intentionally conservative: baseline state at start/load is
 // not awarded as newly completed. Pending native forcefield/endgame handlers
@@ -186,6 +222,10 @@ static void APBridgeWatchStates() {
         s_haveBaseline = 1;
         return;
     }
+    // Each newly entered period is an AP location (1047 + period number).
+    // A completed location is deduplicated across New Games by APBridgeEvent.
+    if (s_lastState[60] != now[60] && now[60] >= 1 && now[60] <= 20)
+        APBridgeEvent(1047 + now[60]);
     // Earliest scripted cutscene after Monday Period 1. This detects the
     // chronological event, NOT a virtual Alien Device inventory grant.
     if (s_lastState[60] == 1 && now[60] == 2) APBridgeEvent(1020);
@@ -298,6 +338,17 @@ void APBridgeGameplayReady() {
     // a new accomplishment; only changes occurring during gameplay count.
     s_haveBaseline = 0;
     APBridgeWatchStates();
+    // First entry may be missed by transition watcher because READY takes a
+    // baseline snapshot; mark the actually loaded/started period once.
+    {
+        GameState* gs = g_GameState_0046aa30;
+        if (gs != 0 && gs->stateValues != 0) {
+            int index = gs->FindState("PERIOD");
+            if (index >= 0 && index < gs->maxStates &&
+                gs->stateValues[index] >= 1 && gs->stateValues[index] <= 20)
+                APBridgeEvent(1047 + gs->stateValues[index]);
+        }
+    }
     sprintf(line, "READY %s %s %d", s_world, s_session, s_generation);
     APBridgeAppend("events.log", line);
 }
@@ -312,6 +363,8 @@ static void APBridgeResetGeneration(const char* eventType) {
     s_ready = 0;
     s_haveBaseline = 0;
     s_charUnlockMask = 1;
+    s_progressivePeriods = 0;
+    s_lastPeriodBlocked = -1;
     s_queuedGrantId = 0;
     s_queuedSequence = 0;
     s_activeGrantId = 0;
@@ -402,6 +455,25 @@ void APBridgePoll() {
     if (remove(inboxPath) != 0) return;
     s_queuedGrantId = itemId;
     s_queuedSequence = seq;
+    if (itemId == 29) {
+        // Each receipt is a distinct copy of the same AP progression item.
+        // Replaying receipts reconstructs the count after a new week or load.
+        int alreadyPresent = s_progressivePeriods >= 19;
+        s_activeGrantId = s_queuedGrantId;
+        s_activeSequence = s_queuedSequence;
+        s_queuedGrantId = 0;
+        s_queuedSequence = 0;
+        if (!alreadyPresent) ++s_progressivePeriods;
+        s_lastPeriodBlocked = -1;
+        APBridgeGrantFinished(itemId, alreadyPresent);
+        {
+            char entry[100];
+            sprintf(entry, "AP_PROGRESSIVE_PERIOD count=%d max=%d",
+                    s_progressivePeriods, APBridgeMaxPeriod());
+            APBridgeAppend("debug.log", entry);
+        }
+        return;
+    }
     if (itemId >= 26 && itemId <= 28) {
         // Virtual character unlocks: no inventory item or original story flag.
         // Same sequence acknowledgment as physical items, so replays on Load
@@ -475,6 +547,7 @@ def main():
     state_path, state, state_eol = load('GameState.cpp')
     newgame_path, newgame, newgame_eol = load('SC_DuctNav.cpp')
     pods_path, pods, pods_eol = load('SC_Pods.cpp')
+    detention_path, detention, detention_eol = load('SC_Detention.cpp')
     bridge_h = ROOT / 'src' / 'APBridge.h'
     bridge_cpp = ROOT / 'src' / 'APBridge.cpp'
     if bridge_h.exists() or bridge_cpp.exists():
@@ -572,6 +645,17 @@ def main():
         '    InitCombatScreen(g_CombatEngine_0046ae78);\n'
         '    if (apTemporaryGun) apState->stateValues[apGunIdx] = 0;',
         'AP equipment pod parse')
+    detention = change_once(detention, '#include "GameState.h"\n',
+                            '#include "GameState.h"\n#include "APBridge.h"\n',
+                            'Detention bridge include')
+    detention = change_once(detention,
+        'void SC_Detention::ResetAnimations() {\n    GameState* gs;',
+        'void SC_Detention::ResetAnimations() {\n'
+        '    // Prototype gate: do not increment PERIOD or fire a locked period\'s events.\n'
+        '    // Existing caller handles returning to the current period menu.\n'
+        '    if (!APBridgeCanEnterNextPeriod()) return;\n'
+        '    GameState* gs;',
+        'Progressive Period pre-transition gate')
     state = change_once(state, '#include "GameState.h"\n',
         '#include "GameState.h"\n#include "APBridge.h"\n', 'Gamestate bridge include')
     state = change_once(state,
@@ -652,9 +736,10 @@ def main():
     state_path.write_bytes(state.replace('\n', state_eol).encode('utf-8'))
     newgame_path.write_bytes(newgame.replace('\n', newgame_eol).encode('utf-8'))
     pods_path.write_bytes(pods.replace('\n', pods_eol).encode('utf-8'))
+    detention_path.write_bytes(detention.replace('\n', detention_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v9 character PoC with softlock protections applied')
+    print('AP bridge v9 Progressive Period PoC applied (character unlocks retained)')
 
 
 if __name__ == '__main__':
