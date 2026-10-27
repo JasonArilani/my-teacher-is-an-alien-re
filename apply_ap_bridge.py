@@ -28,6 +28,7 @@ int APBridgeMaxPeriod();
 int APBridgeCanEnterNextPeriod();
 void APBridgePrepareChoiceMenu();
 void APBridgeOnFocusChange(int toType, int toValue, int fromType, int fromValue);
+void APBridgeTraceStateAction(int stateId, int instruction);
 #endif
 '''
 CPP = r'''#include "APBridge.h"
@@ -60,9 +61,37 @@ static int s_charUnlockMask = 1;
 // Replayed on every New Game or Load from uniquely sequenced AP receipts.
 static int s_progressivePeriods = 0;
 static int s_lastPeriodBlocked = -1;
+// Diagnostic build only: bounded per-New-Game trace for all outstanding checks.
+// Kept in a separate log so normal AP checks and debug.log remain readable.
+static int s_traceLines = 0;
+static const int kMaxTraceLines = 12000;
 
 static void APBridgeWatchStates();
 static void APBridgeAppend(const char* filename, const char* line);
+
+static void APBridgeTraceLine(const char* line) {
+    if (!s_bound || !s_ready || s_worldConflict || s_traceLines >= kMaxTraceLines) return;
+    ++s_traceLines;
+    APBridgeAppend("ap_events_trace.log", line);
+    if (s_traceLines == kMaxTraceLines)
+        APBridgeAppend("debug.log", "AP_TRACE_CAP_REACHED_RESTART_NEW_GAME_FOR_MORE");
+}
+
+// State-changing MIS commands sometimes set and clear a flag within the
+// same game-loop frame; the polling watcher alone would miss those attempts.
+// This only reports the command; it never modifies or consumes the action.
+void APBridgeTraceStateAction(int stateId, int instruction) {
+    GameState* gs = g_GameState_0046aa30;
+    if (gs == 0 || gs->stateValues == 0 || gs->maxStates <= 99 ||
+        stateId < 0 || stateId >= gs->maxStates || stateId >= 450) return;
+    // Repeated identical writes can dominate puzzle animations; the hard cap
+    // also bounds disk usage over long sessions.
+    char line[180];
+    sprintf(line, "AP_TRACE_ACTION idx=%d op=%d before=%d period=%d kid=%d",
+            stateId, instruction, gs->stateValues[stateId],
+            gs->stateValues[60], gs->stateValues[99]);
+    APBridgeTraceLine(line);
+}
 
 // The original pod minigame tests OBJ011, the vanilla pickup flag, rather
 // than checking the actual shared inventory. AP grants deliberately do NOT
@@ -229,6 +258,17 @@ static void APBridgeEvent(int id) {
 void APBridgeOnFocusChange(int toType, int toValue, int fromType, int fromValue) {
     GameState* gs;
     int kid;
+    // Record all focus transitions, not just cinematics. A puzzle may report
+    // success by returning to a room rather than setting a persistent flag.
+    GameState* traceGsAll = g_GameState_0046aa30;
+    if (traceGsAll != 0 && traceGsAll->stateValues != 0 &&
+        traceGsAll->maxStates > 99) {
+        char entry[180];
+        sprintf(entry, "AP_TRACE_FOCUS to=%d/%d from=%d/%d period=%d kid=%d",
+                toType, toValue, fromType, fromValue,
+                traceGsAll->stateValues[60], traceGsAll->stateValues[99]);
+        APBridgeTraceLine(entry);
+    }
     // Period 1 playtesting shows the device discovery plays before the period gate.
     // CIN7810 follows the fire alarm and starts from detention (handler 44).
     // Only this transition in period 1 can award the discovery check.
@@ -328,7 +368,18 @@ static void APBridgeWatchStates() {
         else if (now[60] == 14) APBridgeEvent(1043); // Stacy
         else if (now[60] == 16) APBridgeEvent(1044); // Orville
     }
-    for (i=0; i<450; ++i) s_lastState[i] = now[i];
+    // Log actual state changes, including those performed directly by C++
+    // handlers instead of GAMESTAT.MIS actions. The normal check logic above
+    // still runs first, entirely unchanged.
+    for (i=0; i<450; ++i) {
+        if (s_lastState[i] != now[i]) {
+            char entry[180];
+            sprintf(entry, "AP_TRACE_DELTA idx=%d old=%d new=%d period=%d kid=%d",
+                    i, s_lastState[i], now[i], now[60], now[99]);
+            APBridgeTraceLine(entry);
+        }
+        s_lastState[i] = now[i];
+    }
 }
 
 static int APBridgePath(char* output, const char* leaf) {
@@ -429,6 +480,7 @@ static void APBridgeResetGeneration(const char* eventType) {
     s_charUnlockMask = 1;
     s_progressivePeriods = 0;
     s_lastPeriodBlocked = -1;
+    s_traceLines = 0;  // Fresh trace budget per New Game or Load.
     s_queuedGrantId = 0;
     s_queuedSequence = 0;
     s_activeGrantId = 0;
@@ -731,6 +783,7 @@ def main():
     state = change_once(state,
         '    switch (action->instruction) {\n',
         '    if (APBridgeInterceptRecipeFlag(idx, action->instruction)) return;\n'
+        '    APBridgeTraceStateAction(idx, action->instruction);\n'
         '    switch (action->instruction) {\n', 'Recipe flag interception')
     # Hook actual focus-change completion, not a late/reused state flag.
     # Both success endings and normal duct entry route through this handler.
@@ -810,7 +863,7 @@ def main():
     question_path.write_bytes(question.replace('\n', quest_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v9 stabilization applied (item ownership, maintenance diagnostics, cinematic tracing)')
+    print('AP bridge v9.2 unified event trace applied (all existing v9.1 logic preserved)')
 
 
 if __name__ == '__main__':
