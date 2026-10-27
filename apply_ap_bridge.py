@@ -18,6 +18,10 @@ void APBridgeNewGame();
 void APBridgeGameplayReady();
 int APBridgeInterceptRecipeFlag(int stateId, int instruction);
 int APBridgeHasInventoryItem(int itemId);
+int APBridgeCharacterUnlocked(int characterIndex);
+int APBridgeCurrentCharacterUnlocked();
+int APBridgeCurrentCharacterCanGo();
+void APBridgePrepareChoiceMenu();
 void APBridgeOnFocusChange(int toType, int toValue, int fromType, int fromValue);
 #endif
 '''
@@ -45,8 +49,12 @@ static int s_activeSequence = 0;
 static int s_lastState[450];
 static int s_haveBaseline = 0;
 static unsigned char s_sentEvent[1100];
+// AP-only character access. Bit 0 Peter, bit 1 Susan, bit 2 Duncan.
+// Peter starts enabled in this proof of concept; story flags are untouched.
+static int s_charUnlockMask = 1;
 
 static void APBridgeWatchStates();
+static void APBridgeAppend(const char* filename, const char* line);
 
 // The original pod minigame tests OBJ011, the vanilla pickup flag, rather
 // than checking the actual shared inventory. AP grants deliberately do NOT
@@ -62,6 +70,76 @@ int APBridgeHasInventoryItem(int itemId) {
     return g_SelectedItem_0046a6e4 != 0 && g_SelectedItem_0046a6e4->itemId == itemId;
 }
 
+
+// Called only from the school menu. Indices are Peter=0, Susan=1,
+// Duncan=2 as proven by SKOOL.MIS CHAR entries and the existing bridge.
+// Outside an active AP session, preserve vanilla character selection.
+int APBridgeCharacterUnlocked(int characterIndex) {
+    if (characterIndex < 0 || characterIndex > 2) return 0;
+    if (!s_bound || !s_ready || s_worldConflict) return 1;
+    return (s_charUnlockMask & (1 << characterIndex)) != 0;
+}
+
+// Prevent the Go button from using a previously selected locked character,
+// including when a save was loaded before virtual unlock receipts replay.
+int APBridgeCurrentCharacterUnlocked() {
+    GameState* gs = g_GameState_0046aa30;
+    int stateIndex = g_PeriodStateIdx_0046cb90;
+    if (gs == 0 || gs->stateValues == 0 || stateIndex < 0 ||
+        stateIndex >= gs->maxStates) return 0;
+    return APBridgeCharacterUnlocked(gs->stateValues[stateIndex]);
+}
+
+// The original Choice Menu refuses all portrait clicks after NUM_ACTIONS
+// becomes nonzero. If a save or a scripted transition has already committed
+// a locked character to the remaining action, blocking Go would strand them.
+// This is a narrow fail-safe. It never permits choosing a locked portrait.
+int APBridgeCurrentCharacterCanGo() {
+    if (APBridgeCurrentCharacterUnlocked()) return 1;
+    GameState* gs = g_GameState_0046aa30;
+    if (gs == 0 || gs->stateValues == 0) return 0;
+    int idx = gs->FindState("NUM_ACTIONS");
+    if (idx < 0 || idx >= gs->maxStates) return 0;
+    return gs->stateValues[idx] > 0;
+}
+
+// At the start of a free Choice Menu (no action committed), an old save may
+// point KID to a character not unlocked in AP. Select the first AP-unlocked
+// character whom vanilla rules ALSO allow us to select. Do this BEFORE
+// SKOOL.MIS is parsed, so sprites, sounds and room options see the new KID.
+// Do not change KID after the school has committed NUM_ACTIONS > 0.
+void APBridgePrepareChoiceMenu() {
+    if (!s_bound || !s_ready || s_worldConflict) return;
+    GameState* gs = g_GameState_0046aa30;
+    if (gs == 0 || gs->stateValues == 0) return;
+    int kidIdx = g_PeriodStateIdx_0046cb90;
+    if (kidIdx < 0 || kidIdx >= gs->maxStates) return;
+    if (APBridgeCharacterUnlocked(gs->stateValues[kidIdx])) return;
+    int actionsIdx = gs->FindState("NUM_ACTIONS");
+    if (actionsIdx < 0 || actionsIdx >= gs->maxStates ||
+        gs->stateValues[actionsIdx] != 0) return;
+
+    const char* prefixes[3] = {"P", "S", "D"};
+    const char* suffixes[3] = {"_IN_DETENTION", "_DETENTION_SUSPENSION", "_CAPTURED"};
+    for (int candidate = 0; candidate < 3; ++candidate) {
+        if (!APBridgeCharacterUnlocked(candidate)) continue;
+        int values[3];
+        int valid = 1;
+        for (int flag = 0; flag < 3; ++flag) {
+            char stateName[48];
+            sprintf(stateName, "%s%s", prefixes[candidate], suffixes[flag]);
+            int idx = gs->FindState(stateName);
+            if (idx < 0 || idx >= gs->maxStates) { valid = 0; break; }
+            values[flag] = gs->stateValues[idx];
+        }
+        // The same predicates used by the vanilla char_click path.
+        if (!valid || values[0] != 0 || values[1] > 2 || values[2] != 0)
+            continue;
+        gs->stateValues[kidIdx] = candidate;
+        APBridgeAppend("debug.log", "AP_CHOICE_MENU_RESELECT_UNLOCKED");
+        return;
+    }
+}
 
 // Source-backed state transitions from GAMESTAT.MIS and associated ROOM*.MIS.
 // This watcher is intentionally conservative: baseline state at start/load is
@@ -233,6 +311,7 @@ static void APBridgeResetGeneration(const char* eventType) {
     ++s_generation;
     s_ready = 0;
     s_haveBaseline = 0;
+    s_charUnlockMask = 1;
     s_queuedGrantId = 0;
     s_queuedSequence = 0;
     s_activeGrantId = 0;
@@ -323,6 +402,21 @@ void APBridgePoll() {
     if (remove(inboxPath) != 0) return;
     s_queuedGrantId = itemId;
     s_queuedSequence = seq;
+    if (itemId >= 26 && itemId <= 28) {
+        // Virtual character unlocks: no inventory item or original story flag.
+        // Same sequence acknowledgment as physical items, so replays on Load
+        // and New Game are naturally handled by the existing bridge protocol.
+        int bit = 1 << (itemId - 26);
+        int alreadyPresent = (s_charUnlockMask & bit) != 0;
+        s_activeGrantId = s_queuedGrantId;
+        s_activeSequence = s_queuedSequence;
+        s_queuedGrantId = 0;
+        s_queuedSequence = 0;
+        s_charUnlockMask |= bit;
+        APBridgeGrantFinished(itemId, alreadyPresent);
+        APBridgeAppend("debug.log", "AP_CHARACTER_UNLOCK_APPLIED");
+        return;
+    }
     if (itemId >= 22 && itemId <= 25) {
         // Virtual AP knowledge items. GameState indexes are defined in
         // GAMESTAT.MIS: Water=76, Speech=77, Taste=78, Sound=79.
@@ -515,6 +609,34 @@ def main():
         'School gameplay-ready notification')
     school = change_once(school, '#include "string.h"\n',
         '#include "string.h"\n#include "APBridge.h"\n', 'School bridge include')
+    # Normalize AP-locked initial KID before the original script builds menu UI.
+    # NUM_ACTIONS>0 means the original game has already locked character switching.
+    school = change_once(school,
+        '    ParseFile(this, "mis\\\\skool.mis", "[DURINGSCHOOLMENU]");',
+        '    APBridgePrepareChoiceMenu();\n'
+        '    ParseFile(this, "mis\\\\skool.mis", "[DURINGSCHOOLMENU]");',
+        'Choice Menu initial locked-character recovery')
+    # Character access is checked at the click itself, before original story
+    # eligibility tests. This has no effect on KID/P_CAPTURED/etc. values.
+    school = change_once(school,
+        'char_click:\n    // Character was clicked\n',
+        'char_click:\n    // AP character restrictions are menu-only, not story flags.\n'
+        '    if (!APBridgeCharacterUnlocked(i)) goto check_options;\n'
+        '    // Character was clicked\n',
+        'Character unlock selection gate')
+    school = change_once(school,
+        'check_go:\n    if (selectedOption <= -1) goto check_back;\n',
+        'check_go:\n    // Never permit a locked selected character to enter a room.\n'
+        '    if (!APBridgeCurrentCharacterCanGo()) goto check_back;\n'
+        '    if (selectedOption <= -1) goto check_back;\n',
+        'Character unlock Go-button forced-continuation gate')
+    # Keep the Go button's visible active state consistent with the click gate.
+    # Forced, previously committed characters are allowed through as a fail-safe.
+    school = change_once(school,
+        'selectedOption > -1 && IsCharacterActive() != 0)',
+        'selectedOption > -1 && IsCharacterActive() != 0 &&\n'
+        '        APBridgeCurrentCharacterCanGo())',
+        'Character unlock Go-button forced-continuation visual state')
     # The save/load menu module creates a completely fresh GameState and
     # inventory during New Game; it never calls GameEngine::Serialize.
     newgame = change_once(newgame, '#include "GameEngine.h"\n',
@@ -532,7 +654,7 @@ def main():
     pods_path.write_bytes(pods.replace('\n', pods_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v8.2 applied: v8.1 item fixes plus duct entry and ending checks')
+    print('AP bridge v9 character PoC with softlock protections applied')
 
 
 if __name__ == '__main__':
