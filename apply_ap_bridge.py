@@ -229,10 +229,10 @@ static void APBridgeEvent(int id) {
 void APBridgeOnFocusChange(int toType, int toValue, int fromType, int fromValue) {
     GameState* gs;
     int kid;
-    // Narrow diagnostic for the cutscene after Monday Period 1. We know
-    // the old 1->2 PERIOD watcher is too late when the period gate blocks.
-    // The exact cinematic ID must be identified from a real game trace
-    // before we move location 1020; no guessed check is emitted here.
+    // Period 1 playtesting shows the device discovery plays before the period gate.
+    // CIN7810 follows the fire alarm and starts from detention (handler 44).
+    // Only this transition in period 1 can award the discovery check.
+    // Confirm the cinematic-to-scene match in the next game test.
     if (toType == 3) {
         GameState* traceGs = g_GameState_0046aa30;
         if (traceGs != 0 && traceGs->stateValues != 0) {
@@ -246,6 +246,15 @@ void APBridgeOnFocusChange(int toType, int toValue, int fromType, int fromValue)
                     toValue, traceGs->stateValues[periodIdx],
                     fromType, fromValue);
                 APBridgeAppend("debug.log", entry);
+                if (toValue == 7810 && fromType == 44 && fromValue == 1 &&
+                    traceGs->stateValues[periodIdx] == 1 &&
+                    s_bound && s_ready && !s_worldConflict) {
+                    // Avoid a second award/log if the period is replayed.
+                    if (!s_sentEvent[1020]) {
+                        APBridgeEvent(1020); // Hall - Found Alien Device
+                        APBridgeAppend("debug.log", "AP_ALIEN_DEVICE_CHECK_CIN7810");
+                    }
+                }
             }
         }
     }
@@ -282,9 +291,8 @@ static void APBridgeWatchStates() {
     // A completed location is deduplicated across New Games by APBridgeEvent.
     if (s_lastState[60] != now[60] && now[60] >= 1 && now[60] <= 20)
         APBridgeEvent(1047 + now[60]);
-    // Earliest scripted cutscene after Monday Period 1. This detects the
-    // chronological event, NOT a virtual Alien Device inventory grant.
-    if (s_lastState[60] == 1 && now[60] == 2) APBridgeEvent(1020);
+    // Alien Device location 1020 is sent by CIN7810 before the period gate.
+    // It must not depend on the blocked PERIOD 1 -> 2 state change.
     if (s_lastState[107] == 0 && now[107] != 0) APBridgeEvent(1021); // Yahoo puzzle
     // Duct entry is emitted on focus transition into COMBAT_DUCTNAV (handler 65).
     // BEEN_IN_DUCTWORK is set after returning to certain rooms, too late.
