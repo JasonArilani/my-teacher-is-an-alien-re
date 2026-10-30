@@ -25,6 +25,7 @@ void APBridgeLogMaintenanceSource(int apGranted, int apReturning);
 int APBridgeCharacterUnlocked(int characterIndex);
 int APBridgeCurrentCharacterUnlocked();
 int APBridgeCurrentCharacterCanGo();
+int APBridgeAlienDeviceUnlocked();
 int APBridgeMaxPeriod();
 int APBridgeCanEnterNextPeriod();
 void APBridgePrepareChoiceMenu();
@@ -63,6 +64,7 @@ static int s_startingMask = 1;
 static int s_charUnlockMask = 1;
 // Replayed on every New Game or Load from uniquely sequenced AP receipts.
 static int s_progressivePeriods = 0;
+static int s_alienDeviceUnlocked = 0;
 static int s_lastPeriodBlocked = -1;
 // Diagnostic build only: bounded per-New-Game trace for all outstanding checks.
 // Kept in a separate log so normal AP checks and debug.log remain readable.
@@ -214,6 +216,12 @@ void APBridgePrepareChoiceMenu() {
     }
 }
 
+// The physical device remains part of the story. AP gates opening its menu.
+int APBridgeAlienDeviceUnlocked() {
+    if (!s_bound || !s_ready || s_worldConflict) return 1;
+    return s_alienDeviceUnlocked;
+}
+
 // Virtual Progressive Period item (bridge ID 29). First school period is
 // free; each received copy permits one additional period, up to period 20.
 int APBridgeMaxPeriod() {
@@ -344,9 +352,16 @@ void APBridgeOnFocusChange(int toType, int toValue, int fromType, int fromValue)
     gs = g_GameState_0046aa30;
     if (gs == 0 || gs->stateValues == 0 || gs->maxStates <= 99) return;
     kid = gs->stateValues[99];
-    if (kid == 0) APBridgeEvent(1045);      // Peter - PZ_CRYSTAL
-    else if (kid == 2) APBridgeEvent(1046); // Duncan - CB_GAUNTLET
-    else if (kid == 1) APBridgeEvent(1047); // Susan - QUEST26
+    if (kid == 0) APBridgeEvent(1045);
+    else if (kid == 2) APBridgeEvent(1046);
+    else if (kid == 1) APBridgeEvent(1047);
+    APBridgeEvent(1079);
+    if (toValue == 3202) {
+        if (kid == 0) APBridgeEvent(1080);
+        else if (kid == 2) APBridgeEvent(1081);
+        else if (kid == 1) APBridgeEvent(1082);
+        APBridgeEvent(1083);
+    }
 }
 
 static void APBridgeWatchStates() {
@@ -525,6 +540,7 @@ static void APBridgeResetGeneration(const char* eventType) {
     s_haveBaseline = 0;
     s_charUnlockMask = s_startingMask;
     s_progressivePeriods = 0;
+    s_alienDeviceUnlocked = 0;
     s_lastPeriodBlocked = -1;
     s_traceLines = 0;  // Fresh trace budget per New Game or Load.
     s_queuedGrantId = 0;
@@ -617,6 +633,17 @@ void APBridgePoll() {
     if (remove(inboxPath) != 0) return;
     s_queuedGrantId = itemId;
     s_queuedSequence = seq;
+    if (itemId == 30) {
+        int alreadyPresent = s_alienDeviceUnlocked;
+        s_activeGrantId = s_queuedGrantId;
+        s_activeSequence = s_queuedSequence;
+        s_queuedGrantId = 0;
+        s_queuedSequence = 0;
+        s_alienDeviceUnlocked = 1;
+        APBridgeGrantFinished(itemId, alreadyPresent);
+        APBridgeAppend("debug.log", "AP_ALIEN_DEVICE_UNLOCK_APPLIED");
+        return;
+    }
     if (itemId == 29) {
         // Each receipt is a distinct copy of the same AP progression item.
         // Replaying receipts reconstructs the count after a new week or load.
@@ -715,6 +742,7 @@ def main():
     fire_path, fire, fire_eol = load('SC_FireAlarm.cpp')
     hotspot_path, hotspot, hotspot_eol = load('Hotspot.cpp')
     crystal_path, crystal, crystal_eol = load('SC_CrystalPuzzle.cpp')
+    icon_path, icon, icon_eol = load('IconBar.cpp')
     bridge_h = ROOT / 'src' / 'APBridge.h'
     bridge_cpp = ROOT / 'src' / 'APBridge.cpp'
     if bridge_h.exists() or bridge_cpp.exists():
@@ -903,6 +931,15 @@ def main():
         '            InitNewGame();\n            APBridgeNewGame();\n'
         '            SendGameMessage(3, 10, g_PendingAction_00472d58.addressType,',
         'New Game completed notification')
+    icon = change_once(icon, '#include "IconBar.h"\n',
+                       '#include "IconBar.h"\n#include "APBridge.h"\n',
+                       'Alien Device icon include')
+    icon = change_once(icon,
+        '            if (buttonIndex == 2) {\n                result = 0;',
+        '            if (buttonIndex == 2) {\n'
+        '                if (!APBridgeAlienDeviceUnlocked()) return 1;\n'
+        '                result = 0;',
+        'Alien Device icon gate')
     # True mini-game success, excluding Practice Room and false-success cinematics.
     gauntlet = change_once(gauntlet, '#include "SC_Gauntlet.h"\n',
                            '#include "SC_Gauntlet.h"\n#include "APBridge.h"\n',
@@ -952,6 +989,7 @@ def main():
     fire_path.write_bytes(fire.replace('\n', fire_eol).encode('utf-8'))
     hotspot_path.write_bytes(hotspot.replace('\n', hotspot_eol).encode('utf-8'))
     crystal_path.write_bytes(crystal.replace('\n', crystal_eol).encode('utf-8'))
+    icon_path.write_bytes(icon.replace('\n', icon_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
     print('AP bridge v9.3 event expansion and configurable starting characters applied')
