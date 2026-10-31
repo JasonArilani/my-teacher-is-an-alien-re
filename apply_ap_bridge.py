@@ -20,6 +20,7 @@ void APBridgeGameplayReady();
 int APBridgeInterceptRecipeFlag(int stateId, int instruction);
 int APBridgeHasInventoryItem(int itemId);
 int APBridgeBeginItemEvidence(int itemId, const char* flagName);
+int APBridgeBeginTranslatorMessageClick();
 void APBridgeEndItemEvidence(int previousValue, const char* flagName);
 void APBridgeLogMaintenanceSource(int apGranted, int apReturning);
 int APBridgeCharacterUnlocked(int characterIndex);
@@ -140,6 +141,16 @@ void APBridgeEndItemEvidence(int previousValue, const char* flagName) {
         gs->stateValues[idx] = previousValue;
 }
 
+
+int APBridgeBeginTranslatorMessageClick() {
+    int previous = APBridgeBeginItemEvidence(1, "OBJ001");
+    if (previous >= 0) {
+        char line[120];
+        sprintf(line, "AP_TRANSLATOR_CLICK previous=%d ap_unlocked=%d", previous, s_apTranslatorUnlocked);
+        APBridgeAppend("debug.log", line);
+    }
+    return previous;
+}
 
 void APBridgeLogMaintenanceSource(int apGranted, int apReturning) {
     if (!s_bound || !s_ready || s_worldConflict) return;
@@ -982,6 +993,21 @@ def main():
         '        APBridgeEndItemEvidence(apTranslatorBefore, "OBJ001");\n'
         '        // Dispatch queued actions\n',
         'Translator message scoped evidence restore')
+    room = change_once(room,
+        '    case 2:\n'
+        '        action->addressType = 0x24;\n'
+        '        icons[action->extra1]->HandleClick((SpriteAction*)msg);\n'
+        '        return 1;\n',
+        '    case 2: {\n'
+        '        action->addressType = 0x24;\n'
+        '        int apTranslatorClickBefore = -1;\n'
+        '        if (currentRoom == 16)\n'
+        '            apTranslatorClickBefore = APBridgeBeginTranslatorMessageClick();\n'
+        '        icons[action->extra1]->HandleClick((SpriteAction*)msg);\n'
+        '        APBridgeEndItemEvidence(apTranslatorClickBefore, "OBJ001");\n'
+        '        return 1;\n'
+        '    }\n',
+        'Translator clicked hotspot condition gate')
     # True mini-game success, excluding Practice Room and false-success cinematics.
     gauntlet = change_once(gauntlet, '#include "SC_Gauntlet.h"\n',
                            '#include "SC_Gauntlet.h"\n#include "APBridge.h"\n',
@@ -1035,7 +1061,7 @@ def main():
     room_path.write_bytes(room.replace('\n', room_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge updated with Alien Translator message ownership fix')
+    print('AP bridge updated with Alien Translator message click-path gate')
 
 
 if __name__ == '__main__':
