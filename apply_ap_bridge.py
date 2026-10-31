@@ -972,11 +972,6 @@ def main():
         '        int apTranslatorBefore = -1;\n'
         '        if (targetRoom == 16)\n'
         '            apTranslatorBefore = APBridgeBeginItemEvidence(1, "OBJ001");\n'
-        '        // Susan\'s home finale checks OBJ012, the vanilla pickup flag.\n'
-        '        // Substitute actual AP Business Card ownership during scene parsing.\n'
-        '        int apBusinessCardBefore = -1;\n'
-        '        if (targetRoom == 15 && moduleParam == 1)\n'
-        '            apBusinessCardBefore = APBridgeBeginItemEvidence(12, "OBJ012");\n'
         '        // Parse static scene\n'
         '        sprintf(key, "[SEARCHSCREEN%d_STATIC]", moduleParam);',
         'Translator message scoped evidence start')
@@ -996,7 +991,6 @@ def main():
     room = change_once(room,
         '        // Dispatch queued actions\n',
         '        APBridgeEndItemEvidence(apTranslatorBefore, "OBJ001");\n'
-        '        APBridgeEndItemEvidence(apBusinessCardBefore, "OBJ012");\n'
         '        // Dispatch queued actions\n',
         'Translator message scoped evidence restore')
     room = change_once(room,
@@ -1034,6 +1028,44 @@ def main():
     hotspot = change_once(hotspot, '#include "Hotspot.h"\n',
                           '#include "Hotspot.h"\n#include "APBridge.h"\n',
                           'Teacher test include')
+    # Susan's finale uses a conditional hotspot level for OBJ012 (Business Card).
+    # Declare the variable before the pre-existing `goto done` path so C++
+    # cannot jump across its initialization.
+    hotspot = change_once(hotspot,
+        '    int i;\n    HotspotAction** p;\n',
+        '    int i;\n    HotspotAction** p;\n    int apBusinessCardBefore = -1;\n',
+        'Business Card evidence variable declaration')
+    # The CHECKGAMESTATE runs in HotspotAction::CheckConditions, not during
+    # SEARCHSCREEN1_STATIC parsing. Restrict the bridge override to this one
+    # hotspot and restore the vanilla flag immediately after level selection.
+    hotspot = change_once(hotspot,
+        '    p = &items[0];\n'
+        '    for (i = 0; i < 8; i++) {\n',
+        '    if (hotspotHandle == 1 && parentModuleParam == 1) {\n'
+        '        GameState* gs = g_GameState_0046aa30;\n'
+        '        if (gs != 0 && gs->stateValues != 0) {\n'
+        '            int roomIdx = gs->FindState("ROOM");\n'
+        '            int periodIdx = gs->FindState("PERIOD");\n'
+        '            int kidIdx = g_PeriodStateIdx_0046cb90;\n'
+        '            if (roomIdx >= 0 && roomIdx < gs->maxStates &&\n'
+        '                periodIdx >= 0 && periodIdx < gs->maxStates &&\n'
+        '                kidIdx >= 0 && kidIdx < gs->maxStates &&\n'
+        '                gs->stateValues[roomIdx] == 15 &&\n'
+        '                gs->stateValues[periodIdx] == 20 &&\n'
+        '                gs->stateValues[kidIdx] == 1)\n'
+        '                apBusinessCardBefore = APBridgeBeginItemEvidence(12, "OBJ012");\n'
+        '        }\n'
+        '    }\n'
+        '    p = &items[0];\n'
+        '    for (i = 0; i < 8; i++) {\n',
+        'Susan Business Card runtime hotspot precondition')
+    hotspot = change_once(hotspot,
+        '    T_Hotspot::currentIndex = i;\n',
+        '    // The script checks the AP-owned card while selecting level 6 vs 7.\n'
+        '    // Restore the actual pickup flag before any subsequent game action.\n'
+        '    APBridgeEndItemEvidence(apBusinessCardBefore, "OBJ012");\n'
+        '    T_Hotspot::currentIndex = i;\n',
+        'Susan Business Card runtime hotspot evidence restoration')
     hotspot = change_once(hotspot,
         '        gs->stateValues[testedIdx] = 1;\n',
         '        gs->stateValues[testedIdx] = 1;\n'
