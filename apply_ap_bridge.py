@@ -743,6 +743,7 @@ def main():
     hotspot_path, hotspot, hotspot_eol = load('Hotspot.cpp')
     crystal_path, crystal, crystal_eol = load('SC_CrystalPuzzle.cpp')
     icon_path, icon, icon_eol = load('IconBar.cpp')
+    room_path, room, room_eol = load('SCI_IconBarModule.cpp')
     bridge_h = ROOT / 'src' / 'APBridge.h'
     bridge_cpp = ROOT / 'src' / 'APBridge.cpp'
     if bridge_h.exists() or bridge_cpp.exists():
@@ -940,6 +941,40 @@ def main():
         '                if (!APBridgeAlienDeviceUnlocked()) return 1;\n'
         '                result = 0;',
         'Alien Device icon gate')
+    room = change_once(room,
+        '#include "GameState.h"\n',
+        '#include "GameState.h"\n#include "APBridge.h"\n',
+        'Translator evidence include')
+    room = change_once(room,
+        '        // Parse static scene\n'
+        '        sprintf(key, "[SEARCHSCREEN%d_STATIC]", moduleParam);',
+        '        // The Alien Device messages use OBJ001 to test translation.\n'
+        '        // Temporarily use the real AP inventory state ONLY in room 16.\n'
+        '        // Room 24 retains its vanilla OBJ001 pickup and location check.\n'
+        '        int apTranslatorBefore = -1;\n'
+        '        if (targetRoom == 16)\n'
+        '            apTranslatorBefore = APBridgeBeginItemEvidence(1, "OBJ001");\n'
+        '        // Parse static scene\n'
+        '        sprintf(key, "[SEARCHSCREEN%d_STATIC]", moduleParam);',
+        'Translator message scoped evidence start')
+    room = change_once(room,
+        '    mmPlayer->Draw();\n    pIcon = icons;\n    i = 15;\n',
+        '    int apTranslatorFrameBefore = -1;\n'
+        '    if (currentRoom == 16)\n'
+        '        apTranslatorFrameBefore = APBridgeBeginItemEvidence(1, "OBJ001");\n'
+        '    mmPlayer->Draw();\n    pIcon = icons;\n    i = 15;\n',
+        'Translator runtime evidence begin')
+    room = change_once(room,
+        '    UpdateCursor();\n}\n\n/* Function start: 0x401E40 */',
+        '    UpdateCursor();\n'
+        '    APBridgeEndItemEvidence(apTranslatorFrameBefore, "OBJ001");\n'
+        '}\n\n/* Function start: 0x401E40 */',
+        'Translator runtime evidence restore')
+    room = change_once(room,
+        '        // Dispatch queued actions\n',
+        '        APBridgeEndItemEvidence(apTranslatorBefore, "OBJ001");\n'
+        '        // Dispatch queued actions\n',
+        'Translator message scoped evidence restore')
     # True mini-game success, excluding Practice Room and false-success cinematics.
     gauntlet = change_once(gauntlet, '#include "SC_Gauntlet.h"\n',
                            '#include "SC_Gauntlet.h"\n#include "APBridge.h"\n',
@@ -990,9 +1025,10 @@ def main():
     hotspot_path.write_bytes(hotspot.replace('\n', hotspot_eol).encode('utf-8'))
     crystal_path.write_bytes(crystal.replace('\n', crystal_eol).encode('utf-8'))
     icon_path.write_bytes(icon.replace('\n', icon_eol).encode('utf-8'))
+    room_path.write_bytes(room.replace('\n', room_eol).encode('utf-8'))
     bridge_h.write_text(HEADER, encoding='utf-8')
     bridge_cpp.write_text(CPP, encoding='utf-8')
-    print('AP bridge v9.3 event expansion and configurable starting characters applied')
+    print('AP bridge updated with Alien Translator message ownership fix')
 
 
 if __name__ == '__main__':
