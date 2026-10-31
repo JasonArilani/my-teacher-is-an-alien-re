@@ -972,6 +972,11 @@ def main():
         '        int apTranslatorBefore = -1;\n'
         '        if (targetRoom == 16)\n'
         '            apTranslatorBefore = APBridgeBeginItemEvidence(1, "OBJ001");\n'
+        '        // Susan\'s home finale checks OBJ012, the vanilla pickup flag.\n'
+        '        // Substitute actual AP Business Card ownership during scene parsing.\n'
+        '        int apBusinessCardBefore = -1;\n'
+        '        if (targetRoom == 15 && moduleParam == 1)\n'
+        '            apBusinessCardBefore = APBridgeBeginItemEvidence(12, "OBJ012");\n'
         '        // Parse static scene\n'
         '        sprintf(key, "[SEARCHSCREEN%d_STATIC]", moduleParam);',
         'Translator message scoped evidence start')
@@ -991,6 +996,7 @@ def main():
     room = change_once(room,
         '        // Dispatch queued actions\n',
         '        APBridgeEndItemEvidence(apTranslatorBefore, "OBJ001");\n'
+        '        APBridgeEndItemEvidence(apBusinessCardBefore, "OBJ012");\n'
         '        // Dispatch queued actions\n',
         'Translator message scoped evidence restore')
     room = change_once(room,
