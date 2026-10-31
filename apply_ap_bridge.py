@@ -65,6 +65,7 @@ static int s_charUnlockMask = 1;
 // Replayed on every New Game or Load from uniquely sequenced AP receipts.
 static int s_progressivePeriods = 0;
 static int s_alienDeviceUnlocked = 0;
+static int s_apTranslatorUnlocked = 0;
 static int s_lastPeriodBlocked = -1;
 // Diagnostic build only: bounded per-New-Game trace for all outstanding checks.
 // Kept in a separate log so normal AP checks and debug.log remain readable.
@@ -126,7 +127,8 @@ int APBridgeBeginItemEvidence(int itemId, const char* flagName) {
     int idx = gs->FindState(const_cast<char*>(flagName));
     if (idx < 0 || idx >= gs->maxStates) return -1;
     int previous = gs->stateValues[idx];
-    gs->stateValues[idx] = APBridgeHasInventoryItem(itemId) ? 1 : 0;
+    int ownsItem = itemId == 1 ? s_apTranslatorUnlocked : APBridgeHasInventoryItem(itemId);
+    gs->stateValues[idx] = ownsItem ? 1 : 0;
     return previous;
 }
 void APBridgeEndItemEvidence(int previousValue, const char* flagName) {
@@ -541,6 +543,7 @@ static void APBridgeResetGeneration(const char* eventType) {
     s_charUnlockMask = s_startingMask;
     s_progressivePeriods = 0;
     s_alienDeviceUnlocked = 0;
+    s_apTranslatorUnlocked = 0;
     s_lastPeriodBlocked = -1;
     s_traceLines = 0;  // Fresh trace budget per New Game or Load.
     s_queuedGrantId = 0;
@@ -599,6 +602,10 @@ int APBridgeConsumeGrant(int itemId) {
 void APBridgeGrantFinished(int itemId, int alreadyPresent) {
     char line[220];
     if (!s_bound || s_worldConflict || s_activeGrantId != itemId || s_activeSequence <= 0) return;
+    if (itemId == 1) {
+        s_apTranslatorUnlocked = 1;
+        APBridgeAppend("debug.log", "AP_TRANSLATOR_UNLOCK_APPLIED");
+    }
     sprintf(line, "APPLIED %s %s %d %d %d %d", s_world, s_session,
         s_generation, s_activeSequence, itemId, alreadyPresent);
     APBridgeAppend("applied.log", line);
@@ -949,7 +956,7 @@ def main():
         '        // Parse static scene\n'
         '        sprintf(key, "[SEARCHSCREEN%d_STATIC]", moduleParam);',
         '        // The Alien Device messages use OBJ001 to test translation.\n'
-        '        // Temporarily use the real AP inventory state ONLY in room 16.\n'
+        '        // Temporarily use AP-delivered Translator ownership ONLY in room 16.\n'
         '        // Room 24 retains its vanilla OBJ001 pickup and location check.\n'
         '        int apTranslatorBefore = -1;\n'
         '        if (targetRoom == 16)\n'
